@@ -3,8 +3,8 @@
 Installation with Neuron
 ========================
 
-vLLM 0.3.3 onwards supports model inferencing and serving on AWS Trainium/Inferentia with Neuron SDK.
-At the moment Paged Attention is not supported in Neuron SDK, but naive continuous batching is supported in transformers-neuronx.
+vLLM 0.3.3 onwards supports model inferencing and serving on AWS Trainium/Inferentia with Neuron SDK with continuous batching.
+Paged Attention and Chunked Prefill are currently in development and will be available soon.
 Data types currently supported in Neuron SDK are FP16 and BF16.
 
 Requirements
@@ -128,8 +128,9 @@ Once neuronx-cc and transformers-neuronx packages are installed, we will be able
 
 .. code-block:: console
 
+    $ git clone https://github.com/vllm-project/vllm.git
     $ cd vllm
     $ pip install -U -r requirements-neuron.txt
-    $ pip install .
+    $ VLLM_TARGET_DEVICE="neuron" pip install .
 
 If neuron packages are detected correctly in the installation process, ``vllm-0.3.0+neuron212`` will be installed.

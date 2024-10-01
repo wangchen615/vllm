@@ -2,10 +2,13 @@
 
 Run `pytest tests/test_cache_block_hashing.py`.
 """
+from typing import List, Optional
+
 import pytest
 
-from vllm.transformers_utils.tokenizer import TokenizerGroup
+from vllm.lora.request import LoRARequest
 from vllm.sequence import Sequence
+from vllm.transformers_utils.tokenizer_group import TokenizerGroup
 
 # Make two prefixes with different first blocks.
 prefix_start = [("You are an expert"), ("You are a")]
@@ -36,7 +39,10 @@ def flatten_2d(li):
 @pytest.mark.parametrize("model", ["facebook/opt-125m"])
 @pytest.mark.parametrize("block_size", [16])
 @pytest.mark.parametrize("max_num_seqs", [256])
-def test_auto_prefix_caching(model: str, block_size: int, max_num_seqs: int):
+@pytest.mark.parametrize("concurrent_lora_int_ids",
+                         [[None], [1], [None, 1], [None, 1, 2], [1, 2]])
+def test_auto_prefix_caching(model: str, block_size: int, max_num_seqs: int,
+                             concurrent_lora_int_ids: List[Optional[int]]):
 
     tokenizer = TokenizerGroup(
         tokenizer_id="facebook/opt-125m",
@@ -45,22 +51,36 @@ def test_auto_prefix_caching(model: str, block_size: int, max_num_seqs: int):
         max_input_length=None,
     )
 
-    hashes = []
+    hashes: List[List[List[int]]] = []
 
     for prefix in prefixes:
-        hashes.append([])
-        prompts = [prefix + prompt for prompt in sample_prompts]
-        seq_id = 0
-        for prompt in prompts:
-            hashes[-1].append([])
-            prompt_token_ids = tokenizer.encode(prompt)
-            seq = Sequence(seq_id, prompt, prompt_token_ids, block_size)
+        for lora_int_id in concurrent_lora_int_ids:
+            lora_request = None
 
-            num_blocks = len(prompt_token_ids) // block_size
-            for idx in range(num_blocks):
-                hashes[-1][-1].append(seq.hash_of_block(idx))
+            if lora_int_id is not None:
+                lora_request = LoRARequest(
+                    f"example_lora_{lora_int_id}",
+                    lora_int_id,
+                    f"example/path/to/lora_{lora_int_id}",
+                )
 
-            seq_id += 1
+            hashes.append([])
+            prompts = [prefix + prompt for prompt in sample_prompts]
+            for seq_id, prompt in enumerate(prompts):
+                hashes[-1].append([])
+                prompt_token_ids = tokenizer.encode(prompt)
+                seq = Sequence(seq_id,
+                               inputs={
+                                   "prompt": prompt,
+                                   "prompt_token_ids": prompt_token_ids,
+                               },
+                               block_size=block_size,
+                               eos_token_id=tokenizer.tokenizer.eos_token_id,
+                               lora_request=lora_request)
+
+                num_blocks = len(prompt_token_ids) // block_size
+                for idx in range(num_blocks):
+                    hashes[-1][-1].append(seq.hash_of_block(idx))
 
     # Check that hashes made with two prefixes with different first blocks are
     # different everywhere.
