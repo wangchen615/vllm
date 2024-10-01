@@ -10,6 +10,8 @@ from vllm.utils import (get_distributed_init_method, get_ip, get_open_port,
                         make_async)
 from vllm.worker.worker_base import WorkerBase, WorkerWrapperBase
 
+import time
+
 logger = init_logger(__name__)
 
 
@@ -30,14 +32,28 @@ class GPUExecutor(ExecutorBase):
     uses_ray: bool = False
 
     def _init_executor(self) -> None:
-        """Initialize the worker and load the model.
-        """
+        """Initialize the worker and load the model."""
         assert self.parallel_config.world_size == 1, (
             "GPUExecutor only supports single GPU.")
 
+        start_time = time.time()
+
         self.driver_worker = self._create_worker()
+        worker_creation_time = time.time() - start_time
+        print(f"[chenw]Worker creation time: {worker_creation_time:.2f} seconds")
+
+        device_init_start = time.time()
         self.driver_worker.init_device()
+        device_init_time = time.time() - device_init_start
+        print(f"[chenw]Device initialization time: {device_init_time:.2f} seconds")
+
+        model_load_start = time.time()
         self.driver_worker.load_model()
+        model_load_time = time.time() - model_load_start
+        print(f"[chenw]Model loading time: {model_load_time:.2f} seconds")
+
+        total_time = time.time() - start_time
+        print(f"[chenw]Total initialization time: {total_time:.2f} seconds")
 
     def _get_worker_kwargs(
             self,
