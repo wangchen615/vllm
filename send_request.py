@@ -4,20 +4,23 @@ import requests
 from statistics import mean
 import socket
 import sys
+from datetime import datetime
 
 SCRIPT_START_TIME = time.time()
 
 def wait_for_port(port, host='0.0.0.0', timeout=300):
     """Wait for a port to be ready."""
     start_time = time.time()
-    while True:
-        try:
-            with socket.create_connection((host, port), timeout=1):
-                return True
-        except OSError:
-            time.sleep(1)
-        if time.time() - start_time > timeout:
-            return False
+    start_time_readable = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[chenw] Started waiting for connection at: {start_time_readable}")
+    
+    with socket.create_connection((host, port), timeout=1):
+        end_time = time.time()
+        end_time_readable = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        wait_duration = end_time - start_time
+        print(f"[chenw] Connection established at: {end_time_readable}")
+        print(f"[chenw] Time spent waiting: {wait_duration:.4f} seconds")
+        return True
 
 def send_request(prompt, script_start_time, max_tokens=100, temperature=0.7, max_retries=5):
     url = "http://0.0.0.0:8000/v1/completions"
@@ -66,6 +69,8 @@ def send_request(prompt, script_start_time, max_tokens=100, temperature=0.7, max
 
                             if first_token_time is None:
                                 first_token_time = current_time
+                                first_token_time_readable = datetime.fromtimestamp(first_token_time).strftime('%Y-%m-%d %H:%M:%S')
+                                print(f"[chenw] First token received at: {first_token_time_readable}")
                                 time_to_first_token = first_token_time - script_start_time
                             else:
                                 token_times.append(current_time - request_start_time)
