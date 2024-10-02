@@ -10,6 +10,7 @@ import json
 import ssl
 from argparse import Namespace
 from typing import Any, AsyncGenerator, Optional
+from datetime import datetime
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -132,10 +133,17 @@ async def run_server(args: Namespace,
         **uvicorn_kwargs,
     )
 
+    start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    logger.info(f"Server successfully started and listening on port {args.port} at: {start_time}")
+    
     await shutdown_task
 
 
 if __name__ == "__main__":
+    start_time = datetime.now()
+    start_time_readable = start_time.strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[chenw] API server initialization started at: {start_time_readable}")
+
     parser = FlexibleArgumentParser()
     parser.add_argument("--host", type=str, default=None)
     parser.add_argument("--port", type=int, default=8000)

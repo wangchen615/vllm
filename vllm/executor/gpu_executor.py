@@ -11,6 +11,7 @@ from vllm.utils import (get_distributed_init_method, get_ip, get_open_port,
 from vllm.worker.worker_base import WorkerBase, WorkerWrapperBase
 
 import time
+from datetime import datetime
 
 logger = init_logger(__name__)
 
@@ -37,12 +38,16 @@ class GPUExecutor(ExecutorBase):
             "GPUExecutor only supports single GPU.")
 
         start_time = time.time()
+        start_time_readable = datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[chenw]Initialization started at: {start_time_readable}")
 
         self.driver_worker = self._create_worker()
         worker_creation_time = time.time() - start_time
         print(f"[chenw]Worker creation time: {worker_creation_time:.2f} seconds")
 
         device_init_start = time.time()
+        device_init_start_readable = datetime.fromtimestamp(device_init_start).strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[chenw]Device initialization started at: {device_init_start_readable}")
         self.driver_worker.init_device()
         device_init_time = time.time() - device_init_start
         print(f"[chenw]Device initialization time: {device_init_time:.2f} seconds")
@@ -53,6 +58,9 @@ class GPUExecutor(ExecutorBase):
         print(f"[chenw]Model loading time: {model_load_time:.2f} seconds")
 
         total_time = time.time() - start_time
+        finish_time = time.time()
+        finish_time_readable = datetime.fromtimestamp(finish_time).strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[chenw]Model finished loading at: {finish_time_readable}")
         print(f"[chenw]Total initialization time: {total_time:.2f} seconds")
 
     def _get_worker_kwargs(
