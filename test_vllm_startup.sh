@@ -4,9 +4,9 @@
 VLLM_LOG="vllm_server.log"
 REQUEST_LOG="request.log"
 
-# Function to get current timestamp in seconds with milliseconds
+# Function to get current timestamp in human-readable format
 get_timestamp() {
-    date +%s.%3N
+    date '+%Y-%m-%d %H:%M:%S.%3N'
 }
 
 # Start time
@@ -18,13 +18,11 @@ python -m vllm.entrypoints.openai.api_server \
     --model meta-llama/Llama-2-13b-chat-hf \
     --host 0.0.0.0 \
     --port 8000 > "$VLLM_LOG" 2>&1 &
-
 VLLM_PID=$!
 
 # Start send_request.py in background
 echo "Starting request at $(get_timestamp)" | tee -a "$REQUEST_LOG"
 python send_request.py > "$REQUEST_LOG" 2>&1 &
-
 REQUEST_PID=$!
 
 # Function to check if send_request.py has completed
@@ -51,13 +49,10 @@ REQUEST_END_TIME=$(get_timestamp)
 # Check if send_request.py completed successfully
 if [ $REQUEST_EXIT_CODE -eq 0 ] && grep -q "Full response:" "$REQUEST_LOG"; then
     echo "send_request.py completed successfully"
-    
     # Extract time to first token from request log
     TIME_TO_FIRST_TOKEN=$(grep "Time to first token:" "$REQUEST_LOG" | awk '{print $5}')
-
-    # Calculate total time
-    TOTAL_TIME=$(echo "$REQUEST_END_TIME - $START_TIME" | bc)
-
+    # Calculate total time (in seconds)
+    TOTAL_TIME=$(echo "$(date -d "$REQUEST_END_TIME" +%s.%N) - $(date -d "$START_TIME" +%s.%N)" | bc)
     # Print results
     echo "----------------------------------------"
     echo "Results:"
@@ -65,14 +60,11 @@ if [ $REQUEST_EXIT_CODE -eq 0 ] && grep -q "Full response:" "$REQUEST_LOG"; then
     echo "Time to first token: $TIME_TO_FIRST_TOKEN seconds"
     echo "Total script duration: $TOTAL_TIME seconds"
     echo "----------------------------------------"
-
-    echo "vLLM server log (last 20 lines):"
-    tail -n 20 "$VLLM_LOG"
-
+    echo "vLLM server log (only [chenw] messages):"
+    grep "\[chenw\]" "$VLLM_LOG"
     echo "----------------------------------------"
-    echo "Request log:"
+    echo "Request log (full log):"
     cat "$REQUEST_LOG"
-
     # Kill the vLLM server only after successful completion
     echo "Stopping vLLM server"
     kill $VLLM_PID
