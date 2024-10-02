@@ -14,13 +14,23 @@ def wait_for_port(port, host='0.0.0.0', timeout=300):
     start_time_readable = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"[chenw] Started waiting for connection at: {start_time_readable}")
     
-    with socket.create_connection((host, port), timeout=1):
-        end_time = time.time()
-        end_time_readable = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        wait_duration = end_time - start_time
-        print(f"[chenw] Connection established at: {end_time_readable}")
-        print(f"[chenw] Time spent waiting: {wait_duration:.4f} seconds")
-        return True
+    while True:
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                end_time = time.time()
+                end_time_readable = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                wait_duration = end_time - start_time
+                print(f"[chenw] Connection established at: {end_time_readable}")
+                print(f"[chenw] Time spent waiting: {wait_duration:.4f} seconds")
+                return True
+        except (socket.timeout, ConnectionRefusedError):
+            if time.time() - start_time > timeout:
+                print(f"[chenw] Timeout after {timeout} seconds. Server might not be running.")
+                return False
+            time.sleep(1)  # Wait for 1 second before trying again
+        except Exception as e:
+            print(f"[chenw] Unexpected error while waiting for port: {e}")
+            return False
 
 def send_request(prompt, script_start_time, max_tokens=100, temperature=0.7, max_retries=5):
     url = "http://0.0.0.0:8000/v1/completions"
