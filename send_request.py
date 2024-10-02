@@ -75,7 +75,11 @@ def send_request(prompt, script_start_time, max_tokens=100, temperature=0.7, max
                             else:
                                 token_times.append(current_time - request_start_time)
 
-            total_time = time.time() - request_start_time
+            end_time = time.time()
+            total_time = end_time - request_start_time
+            end_time_readable = datetime.fromtimestamp(end_time).strftime('%Y-%m-%d %H:%M:%S')
+            print(f"[chenw] Full request completed at: {end_time_readable}")
+            print(f"[chenw] Total time for request: {total_time:.4f} seconds")
 
             if len(token_times) > 1:
                 avg_inter_token_latency = mean([token_times[i] - token_times[i-1] for i in range(1, len(token_times))])
