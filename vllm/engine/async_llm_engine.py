@@ -7,13 +7,14 @@ from typing import (Any, AsyncGenerator, Callable, Coroutine, Dict, Iterable,
 from weakref import ReferenceType
 
 import vllm.envs as envs
-from vllm.config import (DecodingConfig, EngineConfig, LoRAConfig, ModelConfig,
-                         ParallelConfig, SchedulerConfig)
+from vllm.config import (DecodingConfig, LoRAConfig, ModelConfig,
+                         ParallelConfig, SchedulerConfig, VllmConfig)
 from vllm.core.scheduler import SchedulerOutputs
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_timeout import asyncio_timeout
 from vllm.engine.llm_engine import LLMEngine, SchedulerOutputState
 from vllm.engine.metrics_types import StatLoggerBase
+from vllm.engine.protocol import EngineClient
 from vllm.executor.executor_base import ExecutorAsyncBase
 from vllm.executor.gpu_executor import GPUExecutorAsync
 from vllm.executor.ray_utils import initialize_ray_cluster
@@ -411,6 +412,12 @@ class _AsyncLLMEngine(LLMEngine):
         """Stop the remote worker execution loop."""
         await self.model_executor.stop_remote_worker_execution_loop_async()
 
+    async def get_tokenizer_async(self,
+                                  lora_request: Optional[LoRARequest] = None
+                                  ) -> AnyTokenizer:
+        return await (
+            self.get_tokenizer_group().get_lora_tokenizer_async(lora_request))
+
     @overload  # DEPRECATED
     async def add_request_async(
         self,
@@ -471,6 +478,10 @@ class _AsyncLLMEngine(LLMEngine):
         if arrival_time is None:
             arrival_time = time.time()
 
+        if self.tokenizer is not None:
+            tokenizer = await self.get_tokenizer_async(lora_request)
+            self._validate_token_prompt(prompt, tokenizer=tokenizer)
+
         preprocessed_inputs = await self.input_preprocessor.preprocess_async(
             prompt,
             request_id=request_id,
@@ -487,7 +498,7 @@ class _AsyncLLMEngine(LLMEngine):
             # implementation in the LLMEngine
             params = await build_guided_decoding_logits_processor_async(
                 sampling_params=params,
-                tokenizer=self.get_tokenizer(lora_request),
+                tokenizer=await self.get_tokenizer_async(lora_request),
                 default_guided_backend=self.decoding_config.
                 guided_decoding_backend)
 
@@ -538,7 +549,7 @@ async def build_guided_decoding_logits_processor_async(
     return sampling_params
 
 
-class AsyncLLMEngine:
+class AsyncLLMEngine(EngineClient):
     """An asynchronous wrapper for :class:`LLMEngine`.
 
     This class is used to wrap the :class:`LLMEngine` class to make it
@@ -593,7 +604,7 @@ class AsyncLLMEngine:
 
     @classmethod
     def _get_executor_cls(
-            cls, engine_config: EngineConfig) -> Type[ExecutorAsyncBase]:
+            cls, engine_config: VllmConfig) -> Type[ExecutorAsyncBase]:
         distributed_executor_backend = (
             engine_config.parallel_config.distributed_executor_backend)
         if isinstance(distributed_executor_backend, type):
@@ -616,6 +627,14 @@ class AsyncLLMEngine:
         elif engine_config.device_config.device_type == "cpu":
             from vllm.executor.cpu_executor import CPUExecutorAsync
             executor_class = CPUExecutorAsync
+        elif engine_config.device_config.device_type == "hpu":
+            if distributed_executor_backend == "ray":
+                initialize_ray_cluster(engine_config.parallel_config)
+                from vllm.executor.ray_hpu_executor import RayHPUExecutorAsync
+                executor_class = RayHPUExecutorAsync
+            else:
+                from vllm.executor.hpu_executor import HPUExecutorAsync
+                executor_class = HPUExecutorAsync
         elif engine_config.device_config.device_type == "openvino":
             assert distributed_executor_backend is None, (
                 "Distributed execution is not supported with "
@@ -652,7 +671,7 @@ class AsyncLLMEngine:
     def from_engine_args(
         cls,
         engine_args: AsyncEngineArgs,
-        engine_config: Optional[EngineConfig] = None,
+        engine_config: Optional[VllmConfig] = None,
         start_engine_loop: bool = True,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: Optional[Dict[str, StatLoggerBase]] = None,
@@ -669,7 +688,7 @@ class AsyncLLMEngine:
 
         # Create the async LLM engine.
         engine = cls(
-            **engine_config.to_dict(),
+            vllm_config=engine_config,
             executor_class=executor_class,
             log_requests=not engine_args.disable_log_requests,
             log_stats=not engine_args.disable_log_stats,
@@ -714,8 +733,7 @@ class AsyncLLMEngine:
         self,
         lora_request: Optional[LoRARequest] = None,
     ) -> AnyTokenizer:
-        return await (self.engine.get_tokenizer_group().
-                      get_lora_tokenizer_async(lora_request))
+        return await self.engine.get_tokenizer_async(lora_request)
 
     def start_background_loop(self) -> None:
         """Start the background loop."""
@@ -802,7 +820,7 @@ class AsyncLLMEngine:
     async def run_engine_loop(engine_ref: ReferenceType):
         """We use a weakref to the engine so that the running loop
         doesn't prevent the engine being garbage collected."""
-        engine: Optional["AsyncLLMEngine"] = engine_ref()
+        engine: Optional[AsyncLLMEngine] = engine_ref()
         if not engine:
             return
 
@@ -998,6 +1016,7 @@ class AsyncLLMEngine:
             >>> # the complete example.
             >>>
             >>> # initialize the engine and the example input
+            >>> # note that engine_args here is AsyncEngineArgs instance
             >>> engine = AsyncLLMEngine.from_engine_args(engine_args)
             >>> example_input = {
             >>>     "prompt": "What is LLM?",
@@ -1043,6 +1062,7 @@ class AsyncLLMEngine:
         request_id: str,
         lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
+        priority: int = 0,
     ) -> AsyncGenerator[EmbeddingRequestOutput, None]:
         """Generate outputs for a request from an embedding model.
 
@@ -1057,6 +1077,8 @@ class AsyncLLMEngine:
             request_id: The unique id of the request.
             lora_request: LoRA request to use for generation, if any.
             trace_headers: OpenTelemetry trace headers.
+            priority: The priority of the request.
+                Only applicable with priority scheduling.
 
         Yields:
             The output `EmbeddingRequestOutput` objects from the LLMEngine
@@ -1078,6 +1100,7 @@ class AsyncLLMEngine:
             >>> # the complete example.
             >>>
             >>> # initialize the engine and the example input
+            >>> # note that engine_args here is AsyncEngineArgs instance
             >>> engine = AsyncLLMEngine.from_engine_args(engine_args)
             >>> example_input = {
             >>>     "input": "What is LLM?",
@@ -1109,6 +1132,7 @@ class AsyncLLMEngine:
                 pooling_params,
                 lora_request=lora_request,
                 trace_headers=trace_headers,
+                priority=priority,
         ):
             yield LLMEngine.validate_output(output, EmbeddingRequestOutput)
 
