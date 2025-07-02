@@ -146,14 +146,17 @@ class OpenAIServingEmbedding(EmbeddingMixin):
         request_logger: Optional[RequestLogger],
         chat_template: Optional[str],
         chat_template_content_format: ChatTemplateContentFormatOption,
+        lora_dir_prefix: Optional[str] = None,
     ) -> None:
         super().__init__(engine_client=engine_client,
                          model_config=model_config,
                          models=models,
-                         request_logger=request_logger)
+                         request_logger=request_logger,
+                         lora_dir_prefix=lora_dir_prefix)
 
         self.chat_template = chat_template
         self.chat_template_content_format: Final = chat_template_content_format
+        self._enabled = self._check_embedding_mode(model_config.embedding_mode)
 
     async def create_embedding(
         self,

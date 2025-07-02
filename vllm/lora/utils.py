@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
-from typing import Optional, Union
+from typing import Dict, List, Optional, Set, Tuple, Type, Union
 
 import huggingface_hub
 import regex as re
@@ -238,3 +238,123 @@ def get_adapter_absolute_path(lora_path: str) -> str:
         return lora_path
 
     return local_snapshot_path
+
+
+def discover_lora_adapters_from_prefix(dir_prefix: str) -> Dict[str, str]:
+    """
+    Discover LoRA adapters from a directory prefix.
+    
+    Args:
+        dir_prefix: The shared directory prefix containing LoRA adapters
+        
+    Returns:
+        Dictionary mapping LoRA names to their full paths
+        
+    Example:
+        If dir_prefix is "/path/to/loras" and contains:
+        /path/to/loras/
+        ├── sql_adapter/
+        │   ├── adapter_config.json
+        │   └── adapter_model.safetensors
+        ├── code_adapter/
+        │   ├── adapter_config.json
+        │   └── adapter_model.safetensors
+        └── math_adapter/
+            ├── adapter_config.json
+            └── adapter_model.safetensors
+            
+        Returns:
+        {
+            "sql_adapter": "/path/to/loras/sql_adapter",
+            "code_adapter": "/path/to/loras/code_adapter", 
+            "math_adapter": "/path/to/loras/math_adapter"
+        }
+    """
+    from pathlib import Path
+    
+    lora_adapters = {}
+    prefix_path = Path(dir_prefix)
+    
+    if not prefix_path.exists():
+        raise ValueError(f"LoRA directory prefix does not exist: {dir_prefix}")
+    
+    if not prefix_path.is_dir():
+        raise ValueError(f"LoRA directory prefix is not a directory: {dir_prefix}")
+    
+    # Iterate through subdirectories
+    for subdir in prefix_path.iterdir():
+        if not subdir.is_dir():
+            continue
+            
+        # Check if this subdirectory contains a valid LoRA adapter
+        config_path = subdir / "adapter_config.json"
+        model_path_safetensors = subdir / "adapter_model.safetensors"
+        model_path_bin = subdir / "adapter_model.bin"
+        
+        # Valid LoRA adapter must have config and at least one model file
+        if (config_path.exists() and 
+            (model_path_safetensors.exists() or model_path_bin.exists())):
+            lora_name = subdir.name
+            lora_adapters[lora_name] = str(subdir)
+    
+    if not lora_adapters:
+        raise ValueError(
+            f"No valid LoRA adapters found in directory prefix: {dir_prefix}. "
+            f"Each subdirectory must contain adapter_config.json and "
+            f"adapter_model.safetensors or adapter_model.bin files."
+        )
+    
+    return lora_adapters
+
+
+def discover_new_lora_adapters_from_prefix(dir_prefix: str, existing_adapters: Set[str]) -> Dict[str, str]:
+    """
+    Discover only new LoRA adapters from a directory prefix that aren't already registered.
+    
+    Args:
+        dir_prefix: The shared directory prefix containing LoRA adapters
+        existing_adapters: Set of adapter names that are already registered
+        
+    Returns:
+        Dictionary mapping LoRA names to their full paths (only new ones)
+        
+    Example:
+        If existing_adapters = {"sql_adapter", "code_adapter"} and the directory
+        now contains {"sql_adapter", "code_adapter", "math_adapter", "new_adapter"},
+        this function will return:
+        {
+            "math_adapter": "/path/to/loras/math_adapter",
+            "new_adapter": "/path/to/loras/new_adapter"
+        }
+    """
+    from pathlib import Path
+    
+    new_adapters = {}
+    prefix_path = Path(dir_prefix)
+    
+    if not prefix_path.exists():
+        return {}
+    
+    if not prefix_path.is_dir():
+        return {}
+    
+    # Iterate through subdirectories
+    for subdir in prefix_path.iterdir():
+        if not subdir.is_dir():
+            continue
+            
+        # Check if this subdirectory contains a valid LoRA adapter
+        config_path = subdir / "adapter_config.json"
+        model_path_safetensors = subdir / "adapter_model.safetensors"
+        model_path_bin = subdir / "adapter_model.bin"
+        
+        # Valid LoRA adapter must have config and at least one model file
+        if (config_path.exists() and 
+            (model_path_safetensors.exists() or model_path_bin.exists())):
+            lora_name = subdir.name
+            
+            # Only include if it's a new adapter
+            if lora_name not in existing_adapters:
+                new_adapters[lora_name] = str(subdir)
+    
+    return new_adapters

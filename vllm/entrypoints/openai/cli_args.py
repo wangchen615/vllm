@@ -130,6 +130,24 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         "``{\"name\": \"name\", \"path\": \"lora_path\", "
         "\"base_model_name\": \"id\"}``")
     parser.add_argument(
+        "--lora-dir-prefix",
+        type=nullable_str,
+        default=None,
+        help="Shared directory prefix for automatically discovering and loading "
+        "multiple LoRA adapters. When specified, vLLM will scan subdirectories "
+        "under this prefix and load all valid LoRA adapters found. Each "
+        "subdirectory should contain adapter_config.json and adapter_model files. "
+        "The LoRA name will be derived from the subdirectory name. "
+        "This is an alternative to --lora-modules for bulk loading.")
+    parser.add_argument(
+        "--lora-discovery-interval",
+        type=int,
+        default=None,
+        help="Interval in seconds for periodic LoRA discovery from the "
+        "directory prefix. If specified, vLLM will periodically scan "
+        "the directory for new LoRA adapters and automatically register "
+        "them. Set to 0 to disable periodic discovery.")
+    parser.add_argument(
         "--prompt-adapters",
         type=optional_type(str),
         default=None,

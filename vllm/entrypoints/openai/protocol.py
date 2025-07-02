@@ -6,7 +6,7 @@
 import json
 import time
 from http import HTTPStatus
-from typing import Annotated, Any, ClassVar, Literal, Optional, Union
+from typing import Annotated, Any, ClassVar, List, Literal, Optional, Union
 
 import regex as re
 import torch
@@ -2131,3 +2131,15 @@ class TranslationResponseVerbose(OpenAIBaseModel):
 
     words: Optional[list[TranslationWord]] = None
     """Extracted words and their corresponding timestamps."""
+
+
+class RefreshLoraDiscoveryRequest(BaseModel):
+    """Request to manually refresh LoRA discovery from the configured directory prefix."""
+    pass
+
+
+class RefreshLoraDiscoveryResponse(BaseModel):
+    """Response for manual LoRA discovery refresh."""
+    message: str
+    discovered_adapters: List[str]
+    total_adapters: int

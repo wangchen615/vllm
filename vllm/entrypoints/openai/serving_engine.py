@@ -59,7 +59,11 @@ from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
                                               TokenizeResponse,
                                               TranscriptionRequest,
                                               TranscriptionResponse,
-                                              TranslationRequest)
+                                              TranslationRequest,
+                                              LoadLoraAdapterRequest,
+                                              UnloadLoraAdapterRequest,
+                                              RefreshLoraDiscoveryRequest,
+                                              RefreshLoraDiscoveryResponse)
 from vllm.entrypoints.openai.serving_models import OpenAIServingModels
 from vllm.entrypoints.openai.tool_parsers import ToolParser
 # yapf: enable
@@ -79,7 +83,7 @@ from vllm.tracing import (contains_trace_headers, extract_trace_headers,
                           log_tracing_disabled_warning)
 from vllm.transformers_utils.tokenizer import AnyTokenizer, MistralTokenizer
 from vllm.utils import (is_list_of, make_async, merge_async_iterators,
-                        random_uuid)
+                        random_uuid, AtomicCounter)
 
 logger = init_logger(__name__)
 
@@ -196,8 +200,8 @@ EmbeddingServeContext.model_rebuild()
 
 class OpenAIServing:
     request_id_prefix: ClassVar[str] = """
-    A short string prepended to every request’s ID (e.g. "embd", "classify")
-    so you can easily tell “this ID came from Embedding vs Classification.”
+    A short string prepended to every request's ID (e.g. "embd", "classify")
+    so you can easily tell "this ID came from Embedding vs Classification."
     """
 
     def __init__(
@@ -209,6 +213,7 @@ class OpenAIServing:
         request_logger: Optional[RequestLogger],
         return_tokens_as_token_ids: bool = False,
         enable_force_include_usage: bool = False,
+        lora_dir_prefix: Optional[str] = None,
     ):
         super().__init__()
 
@@ -217,6 +222,11 @@ class OpenAIServing:
         self.max_model_len = model_config.max_model_len
 
         self.models = models
+        self.lora_dir_prefix = lora_dir_prefix
+
+        # Initialize LoRA counter and requests list
+        self.lora_id_counter = AtomicCounter(0)
+        self.lora_requests = []
 
         self.request_logger = request_logger
         self.return_tokens_as_token_ids = return_tokens_as_token_ids
@@ -971,6 +981,109 @@ class OpenAIServing:
         if not model_name:
             return self.models.base_model_paths[0].name
         return model_name
+
+    async def _check_load_lora_adapter_request(
+            self, request: LoadLoraAdapterRequest) -> Optional[ErrorResponse]:
+        # Check if the lora adapter with the given name exists
+        if any(lora_request.lora_name == request.lora_name
+               for lora_request in self.lora_requests):
+            return self.create_error_response(
+                message=
+                f"The lora adapter '{request.lora_name}' already exists.",
+                err_type="InvalidUserInput",
+                status_code=HTTPStatus.BAD_REQUEST)
+
+        return None
+
+    async def _check_unload_lora_adapter_request(
+            self, request: UnloadLoraAdapterRequest) -> Optional[ErrorResponse]:
+        # Check if the lora adapter with the given name exists
+        if not any(lora_request.lora_name == request.lora_name
+                   for lora_request in self.lora_requests):
+            return self.create_error_response(
+                message=
+                f"The lora adapter '{request.lora_name}' cannot be found.",
+                err_type="InvalidUserInput",
+                status_code=HTTPStatus.BAD_REQUEST)
+
+        return None
+
+    async def load_lora_adapter(
+            self,
+            request: LoadLoraAdapterRequest) -> Union[ErrorResponse, str]:
+        error_check_ret = await self._check_load_lora_adapter_request(request)
+        if error_check_ret is not None:
+            return error_check_ret
+
+        lora_name, lora_path = request.lora_name, request.lora_path
+        unique_id = self.lora_id_counter.inc(1)
+        self.lora_requests.append(
+            LoRARequest(lora_name=lora_name,
+                        lora_int_id=unique_id,
+                        lora_path=lora_path))
+        return f"Success: LoRA adapter '{lora_name}' added successfully."
+
+    async def unload_lora_adapter(
+            self,
+            request: UnloadLoraAdapterRequest) -> Union[ErrorResponse, str]:
+        error_check_ret = await self._check_unload_lora_adapter_request(request
+                                                                        )
+        if error_check_ret is not None:
+            return error_check_ret
+
+        lora_name = request.lora_name
+        self.lora_requests = [
+            lora_request for lora_request in self.lora_requests
+            if lora_request.lora_name != lora_name
+        ]
+        return f"Success: LoRA adapter '{lora_name}' removed successfully."
+
+    async def refresh_lora_discovery(
+            self,
+            request: RefreshLoraDiscoveryRequest) -> Union[ErrorResponse, RefreshLoraDiscoveryResponse]:
+        """Manually refresh LoRA discovery from the configured directory prefix."""
+        # Check if lora_dir_prefix is configured
+        if not hasattr(self, 'lora_dir_prefix') or self.lora_dir_prefix is None:
+            return self.create_error_response(
+                message="LoRA directory prefix is not configured. "
+                "Please set --lora-dir-prefix when starting the server.",
+                err_type="ConfigurationError",
+                status_code=HTTPStatus.BAD_REQUEST)
+        
+        try:
+            # Discover all adapters from the prefix
+            discovered_adapters = discover_lora_adapters_from_prefix(self.lora_dir_prefix)
+            
+            # Track which adapters are newly discovered
+            existing_names = {lora.lora_name for lora in self.lora_requests}
+            new_adapters = []
+            
+            # Register new adapters
+            for adapter_name, adapter_path in discovered_adapters.items():
+                if adapter_name not in existing_names:
+                    new_adapters.append(adapter_name)
+                    
+                    # Create LoRA request and add to the list
+                    unique_id = self.lora_id_counter.inc(1)
+                    self.lora_requests.append(
+                        LoRARequest(lora_name=adapter_name,
+                                    lora_int_id=unique_id,
+                                    lora_path=adapter_path))
+            
+            return RefreshLoraDiscoveryResponse(
+                message=f"Successfully refreshed LoRA discovery. "
+                f"Found {len(discovered_adapters)} total adapters, "
+                f"{len(new_adapters)} newly discovered.",
+                discovered_adapters=new_adapters,
+                total_adapters=len(discovered_adapters)
+            )
+            
+        except Exception as e:
+            logger.error(f"Error during LoRA discovery refresh: {e}")
+            return self.create_error_response(
+                message=f"Failed to refresh LoRA discovery: {str(e)}",
+                err_type="DiscoveryError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
 
 
 def clamp_prompt_logprobs(

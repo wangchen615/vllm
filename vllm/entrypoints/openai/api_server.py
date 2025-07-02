@@ -64,11 +64,13 @@ from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
                                               EmbeddingCompletionRequest,
                                               EmbeddingRequest,
                                               EmbeddingResponse, ErrorResponse,
-                                              LoadLoRAAdapterRequest,
+                                              LoadLoraAdapterRequest,
                                               PoolingChatRequest,
                                               PoolingCompletionRequest,
                                               PoolingRequest, PoolingResponse,
                                               RerankRequest, RerankResponse,
+                                              RefreshLoraDiscoveryRequest,
+                                              RefreshLoraDiscoveryResponse,
                                               ScoreRequest, ScoreResponse,
                                               TokenizeRequest,
                                               TokenizeResponse,
@@ -88,6 +90,7 @@ from vllm.entrypoints.openai.serving_models import (BaseModelPath,
                                                     OpenAIServingModels)
 from vllm.entrypoints.openai.serving_pooling import OpenAIServingPooling
 from vllm.entrypoints.openai.serving_score import ServingScores
+from vllm.entrypoints.openai.serving_engine import LoRAModulePath
 from vllm.entrypoints.openai.serving_tokenization import (
     OpenAIServingTokenization)
 from vllm.entrypoints.openai.serving_transcription import (
@@ -112,6 +115,69 @@ prometheus_multiproc_dir: tempfile.TemporaryDirectory
 logger = init_logger('vllm.entrypoints.openai.api_server')
 
 _running_tasks: set[asyncio.Task] = set()
+
+
+async def periodic_lora_discovery_task(
+    lora_dir_prefix: str,
+    discovery_interval: int,
+    serving_instances: list,
+    base_model_names: list,
+):
+    """
+    Background task for periodic LoRA discovery.
+    
+    Args:
+        lora_dir_prefix: Directory prefix to scan for LoRA adapters
+        discovery_interval: Interval in seconds between scans
+        serving_instances: List of serving instances to update
+        base_model_names: List of base model names
+    """
+    from vllm.lora.utils import discover_new_lora_adapters_from_prefix
+    from vllm.entrypoints.openai.protocol import LoadLoraAdapterRequest
+    
+    logger.info(f"Starting periodic LoRA discovery task with interval {discovery_interval}s")
+    
+    # Track existing adapters to avoid duplicates
+    existing_adapters = set()
+    
+    while True:
+        try:
+            await asyncio.sleep(discovery_interval)
+            
+            # Discover new adapters
+            new_adapters = discover_new_lora_adapters_from_prefix(
+                lora_dir_prefix, existing_adapters)
+            
+            if new_adapters:
+                logger.info(f"Discovered {len(new_adapters)} new LoRA adapters")
+                
+                # Register new adapters with all serving instances
+                for adapter_name, adapter_path in new_adapters.items():
+                    existing_adapters.add(adapter_name)
+                    
+                    # Create LoadLoraAdapterRequest for the API
+                    load_request = LoadLoraAdapterRequest(
+                        lora_name=adapter_name,
+                        lora_path=adapter_path
+                    )
+                    
+                    # Register with each serving instance
+                    for serving_instance in serving_instances:
+                        try:
+                            # This updates the lora_requests list in the serving instance
+                            # The actual LoRA will be loaded by the engine when first requested
+                            await serving_instance.load_lora_adapter(load_request)
+                            logger.info(f"Registered new LoRA adapter: {adapter_name}")
+                            break  # Only need to register with one instance
+                        except Exception as e:
+                            logger.error(f"Failed to register LoRA adapter {adapter_name}: {e}")
+                            
+        except asyncio.CancelledError:
+            logger.info("Periodic LoRA discovery task cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Error in periodic LoRA discovery: {e}")
+            await asyncio.sleep(discovery_interval)  # Continue despite errors
 
 
 @asynccontextmanager
@@ -1049,6 +1115,17 @@ if envs.VLLM_ALLOW_RUNTIME_LORA_UPDATING:
 
         return Response(status_code=200, content=response)
 
+    @router.post("/v1/refresh_lora_discovery")
+    async def refresh_lora_discovery(request: RefreshLoraDiscoveryRequest,
+                                     raw_request: Request):
+        """Manually refresh LoRA discovery from the configured directory prefix."""
+        response = await chat(raw_request).refresh_lora_discovery(request)
+        if isinstance(response, ErrorResponse):
+            return JSONResponse(content=response.model_dump(),
+                                status_code=response.code)
+        
+        return JSONResponse(content=response.model_dump())
+
 
 def load_log_config(log_config_file: Optional[str]) -> Optional[dict]:
     if not log_config_file:
@@ -1233,6 +1310,32 @@ async def init_app_state(
         for name in served_model_names
     ]
 
+    # Handle LoRA directory prefix discovery
+    lora_modules = args.lora_modules
+    if args.lora_dir_prefix is not None:
+        from vllm.lora.utils import discover_lora_adapters_from_prefix
+        
+        try:
+            discovered_loras = discover_lora_adapters_from_prefix(args.lora_dir_prefix)
+            discovered_lora_modules = [
+                LoRAModulePath(name=lora_name, path=lora_path)
+                for lora_name, lora_path in discovered_loras.items()
+            ]
+            
+            # Merge with existing lora_modules if any
+            if lora_modules is not None:
+                lora_modules.extend(discovered_lora_modules)
+            else:
+                lora_modules = discovered_lora_modules
+                
+            logger.info(f"Discovered {len(discovered_loras)} LoRA adapters from prefix: {args.lora_dir_prefix}")
+            for lora_name, lora_path in discovered_loras.items():
+                logger.info(f"  - {lora_name}: {lora_path}")
+                
+        except Exception as e:
+            logger.error(f"Failed to discover LoRA adapters from prefix {args.lora_dir_prefix}: {e}")
+            raise
+
     state.engine_client = engine_client
     state.log_stats = not args.disable_log_stats
     state.vllm_config = vllm_config
@@ -1280,8 +1383,7 @@ async def init_app_state(
         chat_template_content_format=args.chat_template_content_format,
         return_tokens_as_token_ids=args.return_tokens_as_token_ids,
         enable_auto_tools=args.enable_auto_tool_choice,
-        expand_tools_even_if_tool_choice_none=args.
-        expand_tools_even_if_tool_choice_none,
+        expand_tools_even_if_tool_choice_none=args.expand_tools_even_if_tool_choice_none,
         tool_parser=args.tool_call_parser,
         reasoning_parser=args.reasoning_parser,
         enable_prompt_tokens_details=args.enable_prompt_tokens_details,
@@ -1310,7 +1412,7 @@ async def init_app_state(
         request_logger=request_logger,
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
-    ) if model_config.task == "embed" else None
+        lora_dir_prefix=args.lora_dir_prefix)
     state.openai_serving_scores = ServingScores(
         engine_client,
         model_config,
@@ -1336,7 +1438,7 @@ async def init_app_state(
         request_logger=request_logger,
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
-    )
+        lora_dir_prefix=args.lora_dir_prefix)
     state.openai_serving_transcription = OpenAIServingTranscription(
         engine_client,
         model_config,
@@ -1353,6 +1455,30 @@ async def init_app_state(
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
+    
+    # Start periodic LoRA discovery if enabled
+    if (args.lora_dir_prefix is not None and 
+        args.lora_discovery_interval is not None and 
+        args.lora_discovery_interval > 0):
+        
+        serving_instances = [
+            state.openai_serving_chat,
+            state.openai_serving_completion,
+            state.openai_serving_tokenization
+        ]
+        
+        discovery_task = asyncio.create_task(
+            periodic_lora_discovery_task(
+                lora_dir_prefix=args.lora_dir_prefix,
+                discovery_interval=args.lora_discovery_interval,
+                serving_instances=serving_instances,
+                base_model_names=served_model_names
+            )
+        )
+        _running_tasks.add(discovery_task)
+        discovery_task.add_done_callback(_running_tasks.remove)
+        
+        logger.info(f"Started periodic LoRA discovery with interval {args.lora_discovery_interval}s")
 
 
 def create_server_socket(addr: tuple[str, int]) -> socket.socket:
