@@ -8,6 +8,7 @@ import enum
 import hashlib
 import inspect
 import json
+import os
 import textwrap
 import uuid
 import warnings
@@ -2461,6 +2462,16 @@ class LoRAConfig:
     in alphabetic order."""
     bias_enabled: bool = False
     """Enable bias for LoRA adapters."""
+    catalog_type: str = "memory"
+    """Type of LoRA catalog to use. Options:
+    - "memory": Use in-memory catalog (default)
+    - "storage": Use storage-based catalog that scans a directory for LoRA adapters
+    """
+    catalog_path: Optional[str] = None
+    """Path to the storage catalog directory containing LoRA adapters.
+    Only used when catalog_type is "storage". Can be a local path, S3 mount,
+    or any other storage that supports directory listing."""
+
 
     def compute_hash(self) -> str:
         """
@@ -2482,6 +2493,8 @@ class LoRAConfig:
         factors.append(self.lora_extra_vocab_size)
         factors.append(self.lora_vocab_padding_size)
         factors.append(self.bias_enabled)
+        factors.append(self.catalog_type)
+        factors.append(self.catalog_path)
         hash_str = hashlib.md5(str(factors).encode(),
                                usedforsecurity=False).hexdigest()
         return hash_str
@@ -2507,6 +2520,22 @@ class LoRAConfig:
             raise ValueError(
                 f"max_cpu_loras ({self.max_cpu_loras}) must be >= "
                 f"max_loras ({self.max_loras})")
+        
+        # Validate storage catalog configuration
+        if self.catalog_type not in ["memory", "storage"]:
+            raise ValueError(
+                f"catalog_type ({self.catalog_type}) must be one of "
+                f"['memory', 'storage']")
+
+        if self.catalog_type == "storage":
+            if self.catalog_path is None:
+                raise ValueError(
+                    "catalog_path must be specified when catalog_type is 'storage'")
+            if not os.path.exists(self.catalog_path):
+                raise ValueError(
+                    f"catalog_path ({self.catalog_path}) does not exist")
+
+
 
     def verify_with_cache_config(self, cache_config: CacheConfig):
         if cache_config.cpu_offload_gb > 0 and not envs.VLLM_USE_V1:
