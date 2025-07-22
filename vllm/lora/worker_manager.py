@@ -9,7 +9,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.lora.models import (LoRAModel, LoRAModelManager,
-                              LRUCacheLoRAModelManager, create_lora_manager)
+                              LRUCacheLoRAModelManager, StorageCatalogLoRAModelManager, create_lora_manager)
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.request import LoRARequest
 from vllm.lora.utils import get_adapter_absolute_path
@@ -67,6 +67,16 @@ class WorkerLoRAManager:
         self,
         model: torch.nn.Module,
     ) -> Any:
+        # Choose the appropriate manager class based on catalog type
+        if self.lora_config.catalog_type == "storage":
+            manager_cls = StorageCatalogLoRAModelManager
+            manager_kwargs = {
+                "catalog_path": self.lora_config.catalog_path,
+            }
+        else:
+            manager_cls = self._manager_cls
+            manager_kwargs = {}
+
         lora_manager = create_lora_manager(
             model,
             max_num_seqs=self.max_num_seqs,
@@ -74,7 +84,8 @@ class WorkerLoRAManager:
             vocab_size=self.vocab_size,
             lora_config=self.lora_config,
             device=self.device,
-            lora_manager_cls=self._manager_cls,
+            lora_manager_cls=manager_cls,
+            **manager_kwargs,
         )
         self._adapter_manager = lora_manager
         return lora_manager.model
@@ -212,14 +223,25 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
         self,
         model: torch.nn.Module,
     ) -> Any:
+        # Choose the appropriate manager class based on catalog type
+        if self.lora_config.catalog_type == "storage":
+            manager_cls = StorageCatalogLoRAModelManager
+            manager_kwargs = {
+                "catalog_path": self.lora_config.catalog_path,
+            }
+        else:
+            manager_cls = self._manager_cls
+            manager_kwargs = {}
+
         lora_manager = create_lora_manager(
             model,
-            lora_manager_cls=self._manager_cls,
+            lora_manager_cls=manager_cls,
             max_num_seqs=self.max_num_seqs,
             vocab_size=self.vocab_size,
             lora_config=self.lora_config,
             device=self.device,
             max_num_batched_tokens=self.max_num_batched_tokens,
+            **manager_kwargs,
         )
         self._adapter_manager = lora_manager
         return lora_manager.model
