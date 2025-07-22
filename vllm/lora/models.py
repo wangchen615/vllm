@@ -953,9 +953,7 @@ class StorageCatalogLoRAModelManager(LoRAModelManager):
 
     def add_adapter(self, lora: LoRAModel) -> bool:
         """Add a LoRA adapter to the CPU cache."""
-        # Get the adapter name from the lora object
-        adapter_name = getattr(lora, 'adapter_name', None)
-        
+        # Only add to CPU cache, not GPU cache
         if lora.id not in self._cpu_adapters:
             if len(self._cpu_adapters) >= self.max_cpu_adapters:
                 self._cpu_adapters.remove_oldest()
@@ -977,9 +975,22 @@ class StorageCatalogLoRAModelManager(LoRAModelManager):
         if lora_id in self._cpu_adapters:
             lora = self._cpu_adapters.get(lora_id)
             if lora is not None:
-                # Move to GPU cache
+                # Remove from CPU cache and move to GPU cache
+                self._cpu_adapters.remove(lora_id)
+                
+                # Make space in GPU cache if needed
                 if len(self._active_adapters) >= self.lora_slots:
-                    self._active_adapters.remove_oldest()
+                    # Move the evicted adapter to CPU cache
+                    evicted_id = self._active_adapters.remove_oldest()
+                    if evicted_id is not None:
+                        evicted_lora = self._active_adapters.get(evicted_id)
+                        if evicted_lora is not None:
+                            # Add to CPU cache (will handle capacity internally)
+                            if len(self._cpu_adapters) >= self.max_cpu_adapters:
+                                self._cpu_adapters.remove_oldest()
+                            self._cpu_adapters.put(evicted_id, evicted_lora)
+                
+                # Add to GPU cache
                 self._active_adapters.put(lora_id, lora)
                 return super().activate_adapter(lora_id)
         
@@ -991,10 +1002,21 @@ class StorageCatalogLoRAModelManager(LoRAModelManager):
             if expected_id == lora_id:
                 lora = self._load_adapter_from_storage(adapter_name)
                 if lora is not None:
-                    # Add to CPU cache first
-                    self.add_adapter(lora)
-                    # Then activate
-                    return self.activate_adapter(lora.id)
+                    # Make space in GPU cache if needed
+                    if len(self._active_adapters) >= self.lora_slots:
+                        # Move the evicted adapter to CPU cache
+                        evicted_id = self._active_adapters.remove_oldest()
+                        if evicted_id is not None:
+                            evicted_lora = self._active_adapters.get(evicted_id)
+                            if evicted_lora is not None:
+                                # Add to CPU cache (will handle capacity internally)
+                                if len(self._cpu_adapters) >= self.max_cpu_adapters:
+                                    self._cpu_adapters.remove_oldest()
+                                self._cpu_adapters.put(evicted_id, evicted_lora)
+                    
+                    # Add directly to GPU cache
+                    self._active_adapters.put(lora_id, lora)
+                    return super().activate_adapter(lora_id)
         
         logger.warning(f"LoRA adapter {lora_id} not found in storage or cache")
         return False
