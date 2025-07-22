@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import contextlib
 import math
 import os
 import time
@@ -826,25 +827,28 @@ class StorageCatalogLoRAModelManager(LoRAModelManager):
     def _scan_storage_catalog(self) -> set[str]:
         """Scan the storage catalog for available LoRA adapters."""
         current_time = time.time()
-        
+
         # Return cached result if still valid
-        if (self._available_adapters_cache is not None and 
-            current_time - self._cache_timestamp < self._cache_ttl):
+        if (self._available_adapters_cache is not None
+                and current_time - self._cache_timestamp < self._cache_ttl):
             return self._available_adapters_cache
 
         available_adapters = set()
         try:
             if not os.path.exists(self.catalog_path):
-                logger.warning(f"Storage catalog path {self.catalog_path} does not exist")
+                logger.warning("Storage catalog path %s does not exist",
+                               self.catalog_path)
                 return available_adapters
 
             for item in os.listdir(self.catalog_path):
                 item_path = os.path.join(self.catalog_path, item)
-                if os.path.isdir(item_path) and self._is_valid_lora_directory(item_path):
+                if os.path.isdir(item_path) and self._is_valid_lora_directory(
+                        item_path):
                     available_adapters.add(item)
         except Exception as e:
-            logger.warning(f"Error scanning storage catalog {self.catalog_path}: {e}")
-        
+            logger.warning("Error scanning storage catalog %s: %s",
+                           self.catalog_path, e)
+
         self._available_adapters_cache = available_adapters
         self._cache_timestamp = current_time
         return available_adapters
@@ -857,52 +861,52 @@ class StorageCatalogLoRAModelManager(LoRAModelManager):
         """
         if adapter_name in self._name_to_id:
             return self._name_to_id[adapter_name]
-        
+
         # Use global incremental ID for cache management
         adapter_id = get_lora_id()
-        
+
         # Store the mapping
         self._name_to_id[adapter_name] = adapter_id
         self._id_to_name[adapter_id] = adapter_name
-        
+
         return adapter_id
 
     def _is_valid_lora_directory(self, path: str) -> bool:
         """Check if a directory contains valid LoRA files."""
         required_files = ["adapter_config.json"]
         optional_files = ["adapter_model.safetensors", "adapter_model.bin"]
-        
+
         # Check for required files
         for file in required_files:
             if not os.path.exists(os.path.join(path, file)):
                 return False
-        
-        # Check for at least one optional file
-        has_weights = any(os.path.exists(os.path.join(path, file)) 
-                         for file in optional_files)
-        if not has_weights:
-            return False
-        
-        return True
 
-    def _load_adapter_from_storage(self, adapter_name: str) -> Optional[LoRAModel]:
+        # Check for at least one optional file
+        has_weights = any(
+            os.path.exists(os.path.join(path, file))
+            for file in optional_files)
+        return has_weights
+
+    def _load_adapter_from_storage(self,
+                                   adapter_name: str) -> Optional[LoRAModel]:
         """Load a LoRA adapter from storage."""
         adapter_path = os.path.join(self.catalog_path, adapter_name)
-        
+
         if not os.path.exists(adapter_path):
-            logger.warning(f"LoRA adapter {adapter_name} not found at {adapter_path}")
+            logger.warning("LoRA adapter %s not found at %s", adapter_name,
+                           adapter_path)
             return None
-        
+
         try:
             # Get expected LoRA modules from the model
             expected_lora_modules = get_supported_lora_modules(self.model)
-            
+
             # Create PEFTHelper for loading
             peft_helper = PEFTHelper(adapter_path)
-            
+
             # Generate a unique ID for this adapter based on its name
             adapter_id = self._get_adapter_id_from_name(adapter_name)
-            
+
             # Load the LoRA model
             lora_model = LoRAModel.from_local_checkpoint(
                 lora_dir=adapter_path,
@@ -911,44 +915,49 @@ class StorageCatalogLoRAModelManager(LoRAModelManager):
                 lora_model_id=adapter_id,
                 device=str(self.device),
                 dtype=self.lora_config.lora_dtype,
-                target_embedding_padding=self.lora_config.lora_vocab_padding_size,
+                target_embedding_padding=self.lora_config.
+                lora_vocab_padding_size,
             )
-            
+
             # Store the adapter name for future reference
             lora_model.adapter_name = adapter_name
-            
-            logger.info(f"Successfully loaded LoRA adapter {adapter_name} (ID: {adapter_id}) from storage")
+
+            logger.info(
+                "Successfully loaded LoRA adapter %s (ID: %s) from storage",
+                adapter_name, adapter_id)
             return lora_model
-            
+
         except Exception as e:
-            logger.warning(f"Failed to load LoRA adapter {adapter_name} from {adapter_path}: {e}")
+            logger.warning("Failed to load LoRA adapter %s from %s: %s",
+                           adapter_name, adapter_path, e)
             return None
 
     def list_adapters(self) -> dict[int, LoRAModel]:
         """List all available LoRA adapters from storage and cache."""
         # Get adapters from storage
         storage_adapters = self._scan_storage_catalog()
-        
+
         # Get adapters from GPU cache
         gpu_adapters = dict(self._active_adapters.cache)
-        
+
         # Get adapters from CPU cache
         cpu_adapters = dict(self._cpu_adapters.cache)
-        
+
         # Combine all adapters
         all_adapters = {}
         all_adapters.update(gpu_adapters)
         all_adapters.update(cpu_adapters)
-        
+
         # Add storage adapters that aren't cached
         for adapter_name in storage_adapters:
             # Check if we have this adapter in our caches
             adapter_id = self._name_to_id.get(adapter_name)
-            if adapter_id is None or (adapter_id not in gpu_adapters and adapter_id not in cpu_adapters):
+            if adapter_id is None or (adapter_id not in gpu_adapters
+                                      and adapter_id not in cpu_adapters):
                 # Create a placeholder entry for storage-only adapters
                 storage_id = self._get_or_create_adapter_id(adapter_name)
                 all_adapters[storage_id] = None  # Placeholder
-        
+
         return all_adapters
 
     def add_adapter(self, lora: LoRAModel) -> bool:
@@ -970,14 +979,14 @@ class StorageCatalogLoRAModelManager(LoRAModelManager):
         if lora_id in self._active_adapters:
             self._active_adapters.touch(lora_id)
             return super().activate_adapter(lora_id)
-        
+
         # Check if it's in CPU cache
         if lora_id in self._cpu_adapters:
             lora = self._cpu_adapters.get(lora_id)
             if lora is not None:
                 # Remove from CPU cache and move to GPU cache
                 self._cpu_adapters.remove(lora_id)
-                
+
                 # Make space in GPU cache if needed
                 if len(self._active_adapters) >= self.lora_slots:
                     # Move the evicted adapter to CPU cache
@@ -986,14 +995,15 @@ class StorageCatalogLoRAModelManager(LoRAModelManager):
                         evicted_lora = self._active_adapters.get(evicted_id)
                         if evicted_lora is not None:
                             # Add to CPU cache (will handle capacity internally)
-                            if len(self._cpu_adapters) >= self.max_cpu_adapters:
+                            if len(self._cpu_adapters
+                                   ) >= self.max_cpu_adapters:
                                 self._cpu_adapters.remove_oldest()
                             self._cpu_adapters.put(evicted_id, evicted_lora)
-                
+
                 # Add to GPU cache
                 self._active_adapters.put(lora_id, lora)
                 return super().activate_adapter(lora_id)
-        
+
         # Try to load from storage
         storage_adapters = self._scan_storage_catalog()
         for adapter_name in storage_adapters:
@@ -1007,18 +1017,22 @@ class StorageCatalogLoRAModelManager(LoRAModelManager):
                         # Move the evicted adapter to CPU cache
                         evicted_id = self._active_adapters.remove_oldest()
                         if evicted_id is not None:
-                            evicted_lora = self._active_adapters.get(evicted_id)
+                            evicted_lora = self._active_adapters.get(
+                                evicted_id)
                             if evicted_lora is not None:
-                                # Add to CPU cache (will handle capacity internally)
-                                if len(self._cpu_adapters) >= self.max_cpu_adapters:
+                                # Add to CPU cache (capacity managed internally)
+                                cpu_cache_len = len(self._cpu_adapters)
+                                if cpu_cache_len >= self.max_cpu_adapters:
                                     self._cpu_adapters.remove_oldest()
-                                self._cpu_adapters.put(evicted_id, evicted_lora)
-                    
+                                self._cpu_adapters.put(evicted_id,
+                                                       evicted_lora)
+
                     # Add directly to GPU cache
                     self._active_adapters.put(lora_id, lora)
                     return super().activate_adapter(lora_id)
-        
-        logger.warning(f"LoRA adapter {lora_id} not found in storage or cache")
+
+        logger.warning("LoRA adapter %s not found in storage or cache",
+                       lora_id)
         return False
 
     def remove_oldest_adapter(self) -> bool:
@@ -1031,15 +1045,13 @@ class StorageCatalogLoRAModelManager(LoRAModelManager):
     def pin_adapter(self, lora_id: int) -> bool:
         """Pin a LoRA adapter in both CPU and GPU caches."""
         # Pin in CPU cache
-        try:
+        with contextlib.suppress(ValueError):
             self._cpu_adapters.pin(lora_id)
-        except ValueError:
-            pass  # Not in CPU cache, that's okay
-        
+
         # Pin in GPU cache
         if lora_id in self._active_adapters:
             self._active_adapters.pin(lora_id)
-        
+
         return True
 
     def get_adapter(self, adapter_id: int) -> Optional[LoRAModel]:
@@ -1047,11 +1059,11 @@ class StorageCatalogLoRAModelManager(LoRAModelManager):
         # Check GPU cache first
         if adapter_id in self._active_adapters:
             return self._active_adapters.get(adapter_id)
-        
+
         # Check CPU cache
         if adapter_id in self._cpu_adapters:
             return self._cpu_adapters.get(adapter_id)
-        
+
         # Try to load from storage
         storage_adapters = self._scan_storage_catalog()
         for adapter_name in storage_adapters:
@@ -1059,45 +1071,46 @@ class StorageCatalogLoRAModelManager(LoRAModelManager):
             expected_id = self._get_or_create_adapter_id(adapter_name)
             if expected_id == adapter_id:
                 return self._load_adapter_from_storage(adapter_name)
-        
+
         return None
 
     def remove_adapter(self, adapter_id: int) -> bool:
         """Remove a LoRA adapter from caches."""
         removed = False
-        
+
         # Remove from GPU cache
         if adapter_id in self._active_adapters:
             self._active_adapters.remove(adapter_id)
             removed = True
-        
+
         # Remove from CPU cache
         if adapter_id in self._cpu_adapters:
             self._cpu_adapters.remove(adapter_id)
             removed = True
-        
+
         # Remove from name-to-id mapping
         if adapter_id in self._id_to_name:
             adapter_name = self._id_to_name[adapter_id]
             self._name_to_id.pop(adapter_name, None)
             self._id_to_name.pop(adapter_id, None)
-        
+
         return removed
 
     def refresh_storage_catalog(self):
         """Refresh the storage catalog and clean up stale mappings.
         
-        This should be called when the storage catalog is changed by external processes.
-        It will remove mappings for adapters that no longer exist in storage.
+        This should be called when the storage catalog is changed by external
+        processes. It will remove mappings for adapters that no longer exist
+        in storage.
         """
         current_storage_adapters = self._scan_storage_catalog()
-        
+
         # Remove mappings for adapters that no longer exist
         stale_names = []
         for adapter_name in list(self._name_to_id.keys()):
             if adapter_name not in current_storage_adapters:
                 stale_names.append(adapter_name)
-        
+
         for adapter_name in stale_names:
             adapter_id = self._name_to_id[adapter_name]
             # Remove from caches if present
@@ -1108,12 +1121,13 @@ class StorageCatalogLoRAModelManager(LoRAModelManager):
             # Remove from mappings
             self._name_to_id.pop(adapter_name, None)
             self._id_to_name.pop(adapter_id, None)
-        
+
         # Clear the storage cache to force rescan
         self._available_adapters_cache = None
         self._cache_timestamp = 0.0
-        
-        logger.info(f"Refreshed storage catalog. Removed {len(stale_names)} stale mappings.")
+
+        logger.info("Refreshed storage catalog. Removed %s stale mappings.",
+                    len(stale_names))
 
     def get_adapter_name(self, adapter_id: int) -> Optional[str]:
         """Get the adapter name for a given adapter ID."""
@@ -1132,5 +1146,5 @@ class StorageCatalogLoRAModelManager(LoRAModelManager):
 
     def __contains__(self, adapter_id: int) -> bool:
         """Check if an adapter is in any cache."""
-        return (adapter_id in self._active_adapters or 
-                adapter_id in self._cpu_adapters)
+        return (adapter_id in self._active_adapters
+                or adapter_id in self._cpu_adapters)

@@ -3076,13 +3076,13 @@ class LoRAConfig:
     catalog_type: str = "memory"
     """Type of LoRA catalog to use. Options:
     - "memory": Use in-memory catalog (default)
-    - "storage": Use storage-based catalog that scans a directory for LoRA adapters
+    - "storage": Use storage-based catalog that scans a directory for LoRA
+      adapters
     """
     catalog_path: Optional[str] = None
     """Path to the storage catalog directory containing LoRA adapters.
     Only used when catalog_type is "storage". Can be a local path, S3 mount,
     or any other storage that supports directory listing."""
-
 
     def compute_hash(self) -> str:
         """
@@ -3131,7 +3131,7 @@ class LoRAConfig:
             raise ValueError(
                 f"max_cpu_loras ({self.max_cpu_loras}) must be >= "
                 f"max_loras ({self.max_loras})")
-        
+
         # Validate storage catalog configuration
         if self.catalog_type not in ["memory", "storage"]:
             raise ValueError(
@@ -3141,12 +3141,11 @@ class LoRAConfig:
         if self.catalog_type == "storage":
             if self.catalog_path is None:
                 raise ValueError(
-                    "catalog_path must be specified when catalog_type is 'storage'")
+                    "catalog_path must be specified when catalog_type is "
+                    "'storage'")
             if not os.path.exists(self.catalog_path):
                 raise ValueError(
                     f"catalog_path ({self.catalog_path}) does not exist")
-
-
 
     def verify_with_cache_config(self, cache_config: CacheConfig):
         if cache_config.cpu_offload_gb > 0 and not envs.VLLM_USE_V1:
