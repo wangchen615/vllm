@@ -113,6 +113,17 @@ The storage catalog uses the global incremental ID system for cache management:
 
 ### Caching Strategy
 
+The storage catalog uses a two-tier caching system:
+
+1. **GPU Cache**: Contains adapters currently active in GPU memory
+2. **CPU Cache**: Contains adapters that were evicted from GPU cache for faster reloading
+
+**Key Rules:**
+- An adapter can be in either GPU cache OR CPU cache, but never both
+- When an adapter is activated, it moves from CPU cache to GPU cache
+- When an adapter is evicted from GPU cache, it moves to CPU cache
+- When CPU cache is full, oldest adapters are removed entirely
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    Storage Catalog                        │
@@ -122,13 +133,13 @@ The storage catalog uses the global incremental ID system for cache management:
 │  │ adapter_1/  │  │ adapter_2/  │  │ adapter_3/  │      │
 │  └─────────────┘  └─────────────┘  └─────────────┘      │
 ├─────────────────────────────────────────────────────────────┤
-│  CPU Cache (LRU)                                         │
+│  CPU Cache (LRU) - Evicted from GPU                      │
 │  ┌─────────────┐  ┌─────────────┐                        │
-│  │ ID: 1       │  │ ID: 2       │                        │
-│  │ Name: a1    │  │ Name: a2    │                        │
+│  │ ID: 2       │  │ ID: 3       │                        │
+│  │ Name: a2    │  │ Name: a3    │                        │
 │  └─────────────┘  └─────────────┘                        │
 ├─────────────────────────────────────────────────────────────┤
-│  GPU Cache (LRU)                                         │
+│  GPU Cache (LRU) - Currently Active                      │
 │  ┌─────────────┐                                          │
 │  │ ID: 1       │                                          │
 │  │ Name: a1    │                                          │
