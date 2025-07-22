@@ -14,7 +14,9 @@ from vllm.adapter_commons.worker_manager import AbstractWorkerManager
 from vllm.config import LoRAConfig
 from vllm.logger import init_logger
 from vllm.lora.models import (LoRAModel, LoRAModelManager,
-                              LRUCacheLoRAModelManager, StorageCatalogLoRAModelManager, create_lora_manager)
+                              LRUCacheLoRAModelManager,
+                              StorageCatalogLoRAModelManager,
+                              create_lora_manager)
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.request import LoRARequest
 from vllm.lora.utils import get_adapter_absolute_path

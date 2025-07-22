@@ -777,17 +777,19 @@ class EngineArgs:
                                 **lora_kwargs["fully_sharded_loras"])
         lora_group.add_argument("--default-mm-loras",
                                 **lora_kwargs["default_mm_loras"])
-        lora_group.add_argument("--lora-catalog-type",
-                                choices=["memory", "storage"],
-                                default=EngineArgs.lora_catalog_type,
-                                help="Type of LoRA catalog to use. 'memory' uses in-memory catalog, "
-                                "'storage' scans a directory for LoRA adapters.")
-        lora_group.add_argument("--lora-catalog-path",
-                                type=str,
-                                default=EngineArgs.lora_catalog_path,
-                                help="Path to the storage catalog directory containing LoRA adapters. "
-                                "Only used when lora_catalog_type is 'storage'.")
-
+        lora_group.add_argument(
+            "--lora-catalog-type",
+            choices=["memory", "storage"],
+            default=EngineArgs.lora_catalog_type,
+            help="Type of LoRA catalog to use. 'memory' uses in-memory "
+            "catalog, 'storage' scans a directory for LoRA adapters.")
+        lora_group.add_argument(
+            "--lora-catalog-path",
+            type=str,
+            default=EngineArgs.lora_catalog_path,
+            help=
+            "Path to the storage catalog directory containing LoRA adapters. "
+            "Only used when lora_catalog_type is 'storage'.")
 
         # PromptAdapter related configs
         prompt_adapter_kwargs = get_kwargs(PromptAdapterConfig)
@@ -1380,8 +1382,8 @@ class EngineArgs:
             fully_sharded_loras=self.fully_sharded_loras,
             lora_extra_vocab_size=self.lora_extra_vocab_size,
             lora_dtype=self.lora_dtype,
-            max_cpu_loras=self.max_cpu_loras if self.max_cpu_loras
-            and self.max_cpu_loras > 0 else None,
+            max_cpu_loras=self.max_cpu_loras
+            if self.max_cpu_loras and self.max_cpu_loras > 0 else None,
             catalog_type=self.lora_catalog_type,
             catalog_path=self.lora_catalog_path) if self.enable_lora else None
 

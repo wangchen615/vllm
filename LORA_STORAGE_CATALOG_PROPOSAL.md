@@ -318,6 +318,7 @@ The testing script creates a temporary test environment with:
 - **Configuration**: Simulated vLLM engine with storage catalog
 
 ### Sample Adapter Structure
+
 ```
 /tmp/test-lora-adapters/
 ├── adapter_1/
@@ -334,6 +335,7 @@ The testing script creates a temporary test environment with:
 ### Expected Test Output
 
 #### Basic Functionality Test
+
 ```
 🧪 Testing Basic Storage Catalog Functionality
 ==================================================
@@ -351,6 +353,7 @@ The testing script creates a temporary test environment with:
 ```
 
 #### Cache Management Test
+
 ```
 🧪 Testing Cache Management
 ==================================================
@@ -368,6 +371,7 @@ The testing script creates a temporary test environment with:
 ```
 
 #### External Changes Test
+
 ```
 🧪 Testing External Storage Changes
 ==================================================
@@ -385,6 +389,7 @@ The testing script creates a temporary test environment with:
 ```
 
 #### Performance Test
+
 ```
 🧪 Testing Performance
 ==================================================
@@ -402,6 +407,7 @@ The testing script creates a temporary test environment with:
 ```
 
 #### Error Handling Test
+
 ```
 🧪 Testing Error Handling
 ==================================================
@@ -417,6 +423,7 @@ The testing script creates a temporary test environment with:
 ### Advanced Testing
 
 #### Custom Test Directory
+
 ```bash
 python tests/lora/test_lora_storage_catalog.py --test all --test-dir /path/to/custom/test/dir
 ```
@@ -455,31 +462,36 @@ After running tests, verify:
 #### Common Issues
 
 1. **Permission Denied**
+
    ```bash
    # Ensure write permissions to test directory
    chmod 755 /tmp/test-lora-adapters
    ```
 
 2. **Import Errors**
-   ```bash
+  
+```bash
    # Install vLLM with LoRA support
    pip install vllm[lora]
    ```
 
-3. **Test Directory Already Exists**
+1. **Test Directory Already Exists**
+  
    ```bash
-   # Clean up existing test directory
+# Clean up existing test directory
    rm -rf /tmp/test-lora-adapters
+
    ```
 
 #### Debug Mode
 Add debug prints to the test script:
+
 ```python
 import logging
 logging.basicConfig(level=logging.DEBUG)
 ```
 
-### Test Coverage
+## Test Coverage
 
 The testing suite covers:
 
@@ -535,7 +547,7 @@ if __name__ == "__main__":
     asyncio.run(test_cache_management())
 ```
 
-#### 3. External Change Test
+### 3. External Change Test
 
 ```python
 # test_external_changes.py
@@ -677,22 +689,29 @@ engine_args = EngineArgs(
 ### Common Issues
 
 1. **Storage Path Not Found**
+
    ```
    Error: catalog_path (/path/to/adapters) does not exist
    ```
+
    **Solution**: Verify the storage path exists and is accessible
 
 2. **Invalid LoRA Directory**
-   ```
+  
+```
    Warning: Directory /path/to/adapters/invalid_adapter is not a valid LoRA directory
    ```
-   **Solution**: Ensure each adapter directory contains `adapter_config.json` and `adapter_model.safetensors`
+  
+**Solution**: Ensure each adapter directory contains `adapter_config.json` and `adapter_model.safetensors`
 
-3. **Cache Eviction Issues**
+1. **Cache Eviction Issues**
+  
    ```
-   Error: LoRA adapter not found in storage or cache
+Error: LoRA adapter not found in storage or cache
+
    ```
-   **Solution**: Check cache limits and ensure adapters are properly loaded
+   
+**Solution**: Check cache limits and ensure adapters are properly loaded
 
 4. **Performance Issues**
    - **Slow Loading**: Consider increasing `max_cpu_loras` for more CPU caching
@@ -750,4 +769,4 @@ The LoRA storage catalog feature provides a scalable, efficient solution for man
 
 The implementation maintains full API compatibility while introducing new capabilities for dynamic adapter management. The feature is designed to be production-ready with proper error handling, performance optimization, and support for external storage changes.
 
-This proposal represents a significant enhancement to vLLM's LoRA capabilities, enabling new use cases and deployment patterns for large-scale LoRA inference. 
+This proposal represents a significant enhancement to vLLM's LoRA capabilities, enabling new use cases and deployment patterns for large-scale LoRA inference.
