@@ -876,6 +876,13 @@ class StorageCatalogLoRAModelManager(LoRAModelManager):
 
         return adapter_id
 
+    def _get_adapter_id_from_name(self, adapter_name: str) -> int:
+        """Get the adapter ID for a given adapter name.
+        
+        Creates a new ID if the name doesn't exist yet.
+        """
+        return self._get_or_create_adapter_id(adapter_name)
+
     def _is_valid_lora_directory(self, path: str) -> bool:
         """Check if a directory contains valid LoRA files."""
         required_files = ["adapter_config.json"]
