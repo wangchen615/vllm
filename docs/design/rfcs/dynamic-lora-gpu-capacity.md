@@ -124,8 +124,14 @@ class LoRAConfig:
     """GPU memory utilization below which LoRA slots may be expanded.
     Range: 0.0 - 1.0. Only used when dynamic_lora_slots=True."""
 
+    lora_slot_resize_cooldown_s: float = 1.0
+    """Minimum seconds between consecutive LoRA slot resizes.
+    Prevents thrashing when memory utilization oscillates near a watermark.
+    Only used when dynamic_lora_slots=True."""
+
     def __post_init__(self):
-        # Existing validation ...
+        # NOTE: existing max_loras validation (must be >= 1) is preserved.
+        # New fields are validated only when dynamic_lora_slots is enabled.
         if self.dynamic_lora_slots:
             if self.min_loras < 1:
                 raise ValueError("min_loras must be >= 1")
@@ -136,6 +142,9 @@ class LoRAConfig:
                 raise ValueError(
                     "lora_mem_low_watermark must be less than "
                     "lora_mem_high_watermark, both in (0, 1)")
+            if self.lora_slot_resize_cooldown_s < 0:
+                raise ValueError(
+                    "lora_slot_resize_cooldown_s must be >= 0")
 ```
 
 ---
@@ -196,7 +205,7 @@ class LoRAResolver(ABC):
 A lightweight notification interface for external memory managers:
 
 ```python
-import asyncio
+import threading
 from enum import Enum
 from typing import Callable, Optional
 import logging
@@ -223,15 +232,20 @@ class LoRAMemoryNotifier:
     """
 
     _instance: Optional["LoRAMemoryNotifier"] = None
+    _instance_lock: threading.Lock = threading.Lock()
 
     def __init__(self):
+        self._lock = threading.Lock()
         self._callbacks: list[Callable[[GPUMemoryEvent, int], None]] = []
         self._pending_event: Optional[tuple[GPUMemoryEvent, int]] = None
 
     @classmethod
     def get_instance(cls) -> "LoRAMemoryNotifier":
+        # Double-checked locking for thread-safe singleton creation.
         if cls._instance is None:
-            cls._instance = cls()
+            with cls._instance_lock:
+                if cls._instance is None:
+                    cls._instance = cls()
         return cls._instance
 
     def register_resize_callback(
@@ -239,11 +253,13 @@ class LoRAMemoryNotifier:
         cb: Callable[[GPUMemoryEvent, int], None],
     ) -> None:
         """Register a callback to be invoked on memory events."""
-        self._callbacks.append(cb)
+        with self._lock:
+            self._callbacks.append(cb)
 
     def notify(self, event: GPUMemoryEvent, bytes_delta: int) -> None:
         """
         Called by external memory manager to signal a memory change.
+        Thread-safe: may be called from kvcached's thread.
 
         Args:
             event: MEMORY_FREED or MEMORY_CLAIMED
@@ -254,8 +270,10 @@ class LoRAMemoryNotifier:
             event.value,
             bytes_delta,
         )
-        self._pending_event = (event, bytes_delta)
-        for cb in self._callbacks:
+        with self._lock:
+            self._pending_event = (event, bytes_delta)
+            callbacks = list(self._callbacks)
+        for cb in callbacks:
             try:
                 cb(event, bytes_delta)
             except Exception:
@@ -265,8 +283,9 @@ class LoRAMemoryNotifier:
         self,
     ) -> Optional[tuple[GPUMemoryEvent, int]]:
         """Consume and return any pending event (called by engine loop)."""
-        event = self._pending_event
-        self._pending_event = None
+        with self._lock:
+            event = self._pending_event
+            self._pending_event = None
         return event
 ```
 
@@ -306,10 +325,12 @@ def reallocate_lora_weights(self, new_slots: int) -> None:
         new_lora_a.append(new_a)
         new_lora_b.append(new_b)
 
-    # Explicit delete to release GPU memory before allocating new tensors
+    # Explicit delete to release GPU memory references.
+    # NOTE: do NOT call torch.cuda.empty_cache() here — it stalls the CUDA
+    # stream and would be called once per layer in a loop. The caller
+    # (resize_lora_slots) calls it once after all layers are reallocated.
     del self.lora_a_stacked
     del self.lora_b_stacked
-    torch.cuda.empty_cache()
 
     self.lora_a_stacked = tuple(new_lora_a)
     self.lora_b_stacked = tuple(new_lora_b)
@@ -319,6 +340,7 @@ The same pattern applies to other LoRA layer types:
 - `vllm/lora/layers/column_parallel_linear.py`
 - `vllm/lora/layers/row_parallel_linear.py`
 - `vllm/lora/layers/logits_processor.py`
+- `vllm/lora/layers/fused_moe.py`
 
 ---
 
@@ -354,17 +376,20 @@ def resize_lora_slots(self, new_slots: int) -> None:
     logger.info(
         "Resizing LoRA GPU slots: %d -> %d", self._lora_slots, new_slots)
 
-    # Evict active LoRAs if shrinking
+    # Evict active LoRAs if shrinking.
+    # LRUCacheLoRAModelManager._active_adapters is a LoRALRUCache whose
+    # remove_oldest() returns the evicted (key, value) pair.
     if new_slots < self._lora_slots:
         while len(self._active_adapters) > new_slots:
-            evicted_id = self._get_lru_active_adapter_id()
-            self.deactivate_adapter(evicted_id)
+            evicted_id, _ = self._active_adapters.remove_oldest()
+            self._deactivate_adapter(evicted_id)
             logger.debug("Evicted LoRA %d to free GPU slot", evicted_id)
 
-    # Reallocate per-layer tensors
+    # Reallocate per-layer tensors, then release cached GPU memory once.
     for module in self.modules.values():
         if hasattr(module, 'reallocate_lora_weights'):
             module.reallocate_lora_weights(new_slots)
+    torch.cuda.empty_cache()  # Called once after all layers are done
 
     # Resize slot-to-id mapping
     old_mapping = self.lora_index_to_id[:]
@@ -419,6 +444,8 @@ class LLMEngine:
 
     def _setup_dynamic_lora(self) -> None:
         """Register memory notifier callback for external systems."""
+        self._lora_resize_pending = False
+        self._last_lora_resize_time: float = 0.0
         notifier = LoRAMemoryNotifier.get_instance()
         notifier.register_resize_callback(self._on_memory_event)
 
@@ -427,14 +454,16 @@ class LLMEngine:
         event: GPUMemoryEvent,
         bytes_delta: int,
     ) -> None:
-        """Called by external memory manager (e.g., kvcached)."""
-        # Flag for evaluation on next batch boundary
+        """Called by external memory manager (e.g., kvcached).
+        Thread-safe: sets a flag consumed at the next batch boundary."""
         self._lora_resize_pending = True
 
-    def _maybe_resize_lora_slots(self) -> None:
+    async def _maybe_resize_lora_slots(self) -> None:
         """
         Evaluate and apply LoRA slot resize between batches.
         Called after each batch step when dynamic_lora_slots=True.
+        This is an async method — awaits the resolver directly without
+        blocking the engine event loop.
         """
         if not (self.lora_config and self.lora_config.dynamic_lora_slots):
             return
@@ -446,12 +475,15 @@ class LLMEngine:
             return
         self._lora_resize_pending = False
 
+        # Enforce cooldown to prevent thrashing
+        cfg = self.lora_config
+        now = time.monotonic()
+        if now - self._last_lora_resize_time < cfg.lora_slot_resize_cooldown_s:
+            return
+
         free, total = torch.cuda.mem_get_info()
         utilization = 1.0 - free / total
-        current = self.executor.collective_rpc_single(
-            "get_lora_slots")[0]
-
-        cfg = self.lora_config
+        current = self.executor.collective_rpc_single("get_lora_slots")[0]
 
         # Watermark-based initial decision
         if utilization > cfg.lora_mem_high_watermark:
@@ -461,25 +493,18 @@ class LLMEngine:
         else:
             desired = None  # In green zone — defer to resolver
 
-        # Ask resolver for fine-grained policy
-        resolver_desired = None
+        # Await resolver directly (no thread bridging needed in async engine)
         for resolver in LoRAResolverRegistry.get_all_resolvers():
             active_loras = self._get_active_lora_names()
-            resolver_desired = asyncio.run_coroutine_threadsafe(
-                resolver.get_desired_lora_slots(
-                    current_slots=current,
-                    active_loras=active_loras,
-                    free_gpu_memory_bytes=free,
-                    total_gpu_memory_bytes=total,
-                ),
-                self._event_loop,
-            ).result(timeout=1.0)
+            resolver_desired = await resolver.get_desired_lora_slots(
+                current_slots=current,
+                active_loras=active_loras,
+                free_gpu_memory_bytes=free,
+                total_gpu_memory_bytes=total,
+            )
             if resolver_desired is not None:
+                desired = resolver_desired
                 break
-
-        # Resolver overrides watermark decision if provided
-        if resolver_desired is not None:
-            desired = resolver_desired
 
         if desired is None or desired == current:
             return
@@ -489,6 +514,7 @@ class LLMEngine:
 
         if desired != current:
             self._broadcast_resize_lora_slots(desired)
+            self._last_lora_resize_time = time.monotonic()
 
     def _broadcast_resize_lora_slots(self, new_slots: int) -> None:
         """Coordinate resize across all TP workers via collective RPC."""
@@ -550,7 +576,7 @@ def _get_lora_cases(self) -> list[int]:
 
 | Component | Responsibility |
 |---|---|
-| `LoRAConfig` fields | `min_loras`, `dynamic_lora_slots`, watermark thresholds |
+| `LoRAConfig` fields | `min_loras`, `dynamic_lora_slots`, watermark thresholds, `lora_slot_resize_cooldown_s` |
 | `LoRAModelManager.resize_lora_slots()` | GPU tensor reallocation + LRU eviction |
 | `BaseLinearLayerWithLoRA.reallocate_lora_weights()` | Per-layer tensor realloc |
 | `WorkerLoRAManager.resize_lora_slots()` | RPC-exposed worker method |
@@ -647,7 +673,8 @@ This gives the resolver fine-grained control over both capacity and which adapte
 | Resize above `max_loras` | Clamped to `max_loras` |
 | OOM during tensor realloc | PyTorch OOM exception propagated; current slots unchanged (best-effort rollback) |
 | TP worker resize failure | Collective RPC failure — engine logs error and retains current slots |
-| Resolver timeout | `get_desired_lora_slots` call has 1s timeout; skipped if exceeded |
+| Resolver raises exception | Logged and ignored; watermark decision used as fallback |
+| Cooldown active | Resize skipped; re-evaluated on next batch boundary after cooldown |
 | kvcached notifies while batch running | Event queued; consumed at next batch boundary |
 
 ---
@@ -667,8 +694,9 @@ llm = LLM(
         "max_loras": 8,           # Upper bound
         "min_loras": 1,           # Lower bound
         "dynamic_lora_slots": True,
-        "lora_mem_high_watermark": 0.80,  # Shrink above 80% GPU utilization
-        "lora_mem_low_watermark": 0.50,   # Grow below 50% GPU utilization
+        "lora_mem_high_watermark": 0.80,    # Shrink above 80% GPU utilization
+        "lora_mem_low_watermark": 0.50,     # Grow below 50% GPU utilization
+        "lora_slot_resize_cooldown_s": 1.0, # Min seconds between resizes
     }
 )
 ```
@@ -687,6 +715,7 @@ llm = LLM(
 | `vllm/lora/layers/column_parallel_linear.py` | Modify | Add `reallocate_lora_weights()` |
 | `vllm/lora/layers/row_parallel_linear.py` | Modify | Add `reallocate_lora_weights()` |
 | `vllm/lora/layers/logits_processor.py` | Modify | Add `reallocate_lora_weights()` |
+| `vllm/lora/layers/fused_moe.py` | Modify | Add `reallocate_lora_weights()` |
 | `vllm/lora/worker_manager.py` | Modify | Expose `resize_lora_slots()` as RPC target |
 | `vllm/v1/engine/llm_engine.py` | Modify | Add `_maybe_resize_lora_slots()` post-batch hook |
 | `vllm/v1/worker/gpu_worker.py` | Modify | Add `resize_lora_slots()` + `get_lora_slots()` RPC methods |
@@ -696,8 +725,9 @@ llm = LLM(
 
 ## Open Questions
 
-1. **Resize frequency throttling**: Should there be a minimum time between resizes (e.g., no more than once per second) to avoid thrashing?
-2. **Metrics**: Should current `lora_slots` be exposed as a Prometheus gauge so operators can observe dynamic behavior?
-3. **PP (Pipeline Parallelism)**: This RFC covers TP coordination. PP adds another dimension — is PP in scope?
-4. **Rollback on OOM**: On `torch.cuda.OutOfMemoryError` during reallocation, should we attempt to restore the previous slot count, or just log and keep whatever partial state exists?
-5. **kvcached API**: Should `LoRAMemoryNotifier` be the stable integration point, or should we coordinate with the kvcached project on a richer bidirectional interface?
+1. **Metrics**: Should current `lora_slots` be exposed as a Prometheus gauge so operators can observe dynamic behavior?
+2. **PP (Pipeline Parallelism)**: This RFC is scoped to TP coordination only. PP support (coordinating resize across pipeline stages) is deferred as a follow-up.
+3. **Rollback on OOM**: On `torch.cuda.OutOfMemoryError` during reallocation, should we attempt to restore the previous slot count, or just log and retain whatever partial state exists?
+4. **kvcached API**: Should `LoRAMemoryNotifier` be the stable integration point, or should we coordinate with the kvcached project on a richer bidirectional interface?
+
+> **Resolved**: Resize frequency throttling is handled by the `lora_slot_resize_cooldown_s` config field (default 1.0s), added in Section 1.
