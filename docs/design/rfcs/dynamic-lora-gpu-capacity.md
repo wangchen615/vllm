@@ -45,7 +45,7 @@ Additionally, systems like [kvcached](https://github.com/ovg-project/kvcached) d
 
 ### High-Level Architecture
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │                        vLLM Engine                          │
 │                                                             │
@@ -337,6 +337,7 @@ def reallocate_lora_weights(self, new_slots: int) -> None:
 ```
 
 The same pattern applies to other LoRA layer types:
+
 - `vllm/lora/layers/column_parallel_linear.py`
 - `vllm/lora/layers/row_parallel_linear.py`
 - `vllm/lora/layers/logits_processor.py`
@@ -575,7 +576,7 @@ def _get_lora_cases(self) -> list[int]:
 ### Core vLLM (this RFC)
 
 | Component | Responsibility |
-|---|---|
+| --- | --- |
 | `LoRAConfig` fields | `min_loras`, `dynamic_lora_slots`, watermark thresholds, `lora_slot_resize_cooldown_s` |
 | `LoRAModelManager.resize_lora_slots()` | GPU tensor reallocation + LRU eviction |
 | `BaseLinearLayerWithLoRA.reallocate_lora_weights()` | Per-layer tensor realloc |
@@ -589,7 +590,7 @@ def _get_lora_cases(self) -> list[int]:
 ### Plugin Package (e.g., `vllm-dynamic-lora-plugin`)
 
 | Component | Responsibility |
-|---|---|
+| --- | --- |
 | Custom `LoRAResolver` subclass | Implements `get_desired_lora_slots()` with load-aware policy |
 | kvcached integration | Calls `LoRAMemoryNotifier.notify()` on memory events |
 | Policy logic | Decides slot counts based on request rates, queue depths, memory |
@@ -667,7 +668,7 @@ This gives the resolver fine-grained control over both capacity and which adapte
 ## Failure Modes and Safety
 
 | Scenario | Handling |
-|---|---|
+| --- | --- |
 | Resize during batch | Not possible — resize only triggered post-batch |
 | Resize to 0 | Clamped to `min_loras` (≥ 1) |
 | Resize above `max_loras` | Clamped to `max_loras` |
@@ -706,7 +707,7 @@ llm = LLM(
 ## Files to Modify
 
 | File | Change Type | Description |
-|---|---|---|
+| --- | --- | --- |
 | `vllm/config/lora.py` | Modify | Add `min_loras`, `dynamic_lora_slots`, watermark fields |
 | `vllm/lora/resolver.py` | Modify | Add `get_desired_lora_slots()` default method |
 | `vllm/lora/memory_notifier.py` | **New** | `LoRAMemoryNotifier` + `GPUMemoryEvent` |
