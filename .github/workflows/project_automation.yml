@@ -1,0 +1,142 @@
+name: Project Board Automation
+
+on:
+  issues:
+    types: [closed, reopened]
+
+permissions:
+  issues: read
+
+jobs:
+  unblock-ready:
+    name: Move unblocked issues to Ready
+    runs-on: ubuntu-latest
+    # Only run for issues closed in our fork (not upstream syncs)
+    if: github.repository == 'wangchen615/vllm'
+    steps:
+      - name: Promote unblocked issues to Ready
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd  # v8.0.0
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+        with:
+          github-token: ${{ secrets.PROJECT_TOKEN }}
+          script: |
+            const PROJECT_NUMBER = 2;
+            const OWNER = 'wangchen615';
+
+            // Status option IDs on the project board
+            const STATUS = {
+              BLOCKED: 'fc3b9aed',
+              READY:   'ab7c1b26',
+            };
+
+            const closedIssueNumber = context.payload.issue.number;
+            const eventType = context.payload.action; // 'closed' or 'reopened'
+            core.info(`Trigger: issue #${closedIssueNumber} was ${eventType}`);
+
+            // --- GraphQL helpers ---
+
+            async function graphql(query, variables = {}) {
+              return github.graphql(query, variables);
+            }
+
+            // Fetch the project node ID and the Status field ID
+            async function getProject() {
+              const data = await graphql(`
+                query($owner: String!, $number: Int!) {
+                  user(login: $owner) {
+                    projectV2(number: $number) {
+                      id
+                      field(name: "Status") {
+                        ... on ProjectV2SingleSelectField { id }
+                      }
+                    }
+                  }
+                }`, { owner: OWNER, number: PROJECT_NUMBER });
+              const pv2 = data.user.projectV2;
+              return { projectId: pv2.id, statusFieldId: pv2.field.id };
+            }
+
+            // Fetch all open issues on the project that are currently Blocked,
+            // along with their blocking issues.
+            async function getBlockedItems(projectId) {
+              const data = await graphql(`
+                query($projectId: ID!) {
+                  node(id: $projectId) {
+                    ... on ProjectV2 {
+                      items(first: 100) {
+                        nodes {
+                          id
+                          fieldValues(first: 10) {
+                            nodes {
+                              ... on ProjectV2ItemFieldSingleSelectValue {
+                                optionId
+                                field { ... on ProjectV2SingleSelectField { name } }
+                              }
+                            }
+                          }
+                          content {
+                            ... on Issue {
+                              number
+                              state
+                              blockedByIssues(first: 20) {
+                                nodes { number state }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }`, { projectId });
+
+              return data.node.items.nodes.filter(item => {
+                if (!item.content || item.content.__typename === 'DraftIssue') return false;
+                const statusField = item.fieldValues.nodes.find(
+                  v => v.field && v.field.name === 'Status'
+                );
+                return statusField && statusField.optionId === STATUS.BLOCKED;
+              });
+            }
+
+            // Set the Status field of a project item
+            async function setStatus(projectId, statusFieldId, itemId, optionId, issueNumber) {
+              await graphql(`
+                mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $projectId
+                    itemId: $itemId
+                    fieldId: $fieldId
+                    value: { singleSelectOptionId: $optionId }
+                  }) { projectV2Item { id } }
+                }`, { projectId, itemId, fieldId: statusFieldId, optionId });
+              core.info(`  ✓ Issue #${issueNumber} → ${optionId === STATUS.READY ? 'Ready' : 'Blocked'}`);
+            }
+
+            // --- Main logic ---
+
+            const { projectId, statusFieldId } = await getProject();
+            const blockedItems = await getBlockedItems(projectId);
+            core.info(`Found ${blockedItems.length} Blocked item(s) on board`);
+
+            for (const item of blockedItems) {
+              const issue = item.content;
+              const blockers = issue.blockedByIssues.nodes;
+
+              if (eventType === 'closed') {
+                // All blockers must be closed for this issue to become Ready
+                const openBlockers = blockers.filter(b => b.state === 'OPEN');
+                core.info(`Issue #${issue.number}: ${openBlockers.length} open blocker(s) remaining`);
+                if (openBlockers.length === 0) {
+                  core.info(`  All blockers resolved — promoting #${issue.number} to Ready`);
+                  await setStatus(projectId, statusFieldId, item.id, STATUS.READY, issue.number);
+                }
+              } else if (eventType === 'reopened') {
+                // If the reopened issue is a blocker of this one, move it back to Blocked
+                const isBlocker = blockers.some(b => b.number === closedIssueNumber);
+                if (isBlocker) {
+                  core.info(`  Blocker #${closedIssueNumber} reopened — moving #${issue.number} back to Blocked`);
+                  await setStatus(projectId, statusFieldId, item.id, STATUS.BLOCKED, issue.number);
+                }
+              }
+            }
