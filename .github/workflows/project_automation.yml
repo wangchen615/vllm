@@ -3,6 +3,9 @@ name: Project Board Automation
 on:
   issues:
     types: [closed, reopened]
+  # Also fires when someone manually drags a card to Done on the board
+  projects_v2_item:
+    types: [edited]
 
 permissions:
   issues: read
@@ -11,7 +14,7 @@ jobs:
   unblock-ready:
     name: Move unblocked issues to Ready
     runs-on: ubuntu-latest
-    # Only run for issues closed in our fork (not upstream syncs)
+    # Only run for issues in our fork (not upstream syncs)
     if: github.repository == 'wangchen615/vllm'
     steps:
       - name: Promote unblocked issues to Ready
@@ -26,13 +29,54 @@ jobs:
 
             // Status option IDs on the project board
             const STATUS = {
+              DONE:    'e57d8fbd',
               BLOCKED: 'fc3b9aed',
               READY:   'ab7c1b26',
             };
 
-            const closedIssueNumber = context.payload.issue.number;
-            const eventType = context.payload.action; // 'closed' or 'reopened'
-            core.info(`Trigger: issue #${closedIssueNumber} was ${eventType}`);
+            // Determine trigger source and resolve the "completed issue number"
+            // for the unblock-check below.
+            let completedIssueNumber = null;
+            let eventType = context.eventName;
+
+            if (context.eventName === 'issues') {
+              eventType = context.payload.action; // 'closed' or 'reopened'
+              completedIssueNumber = context.payload.issue.number;
+              core.info(`Trigger: issue #${completedIssueNumber} was ${eventType}`);
+
+            } else if (context.eventName === 'projects_v2_item') {
+              // Only care about Status field edits that land on Done
+              const changes = context.payload.changes;
+              const fieldNodeId = changes?.field_value?.field_node_id;
+              const newValue   = changes?.field_value?.to?.option_id;
+              const oldValue   = changes?.field_value?.from?.option_id;
+
+              if (!fieldNodeId || newValue !== STATUS.DONE) {
+                core.info('projects_v2_item edit is not a Status→Done change, skipping');
+                return;
+              }
+              core.info(`projects_v2_item: Status changed from ${oldValue} → Done`);
+
+              // Resolve the issue number from the item's content_node_id
+              const contentNodeId = context.payload.projects_v2_item?.content_node_id;
+              if (!contentNodeId) {
+                core.info('No content_node_id on item, skipping');
+                return;
+              }
+              const nodeData = await github.graphql(`
+                query($id: ID!) {
+                  node(id: $id) { ... on Issue { number state } }
+                }`, { id: contentNodeId });
+              if (!nodeData.node || !nodeData.node.number) {
+                core.info('Item is not an Issue (may be a PR or draft), skipping');
+                return;
+              }
+              completedIssueNumber = nodeData.node.number;
+              // Treat a manual Done-move the same as closing the issue
+              eventType = 'closed';
+              core.info(`Trigger: project item for issue #${completedIssueNumber} moved to Done`);
+
+            }
 
             // --- GraphQL helpers ---
 
@@ -133,9 +177,9 @@ jobs:
                 }
               } else if (eventType === 'reopened') {
                 // If the reopened issue is a blocker of this one, move it back to Blocked
-                const isBlocker = blockers.some(b => b.number === closedIssueNumber);
+                const isBlocker = blockers.some(b => b.number === completedIssueNumber);
                 if (isBlocker) {
-                  core.info(`  Blocker #${closedIssueNumber} reopened — moving #${issue.number} back to Blocked`);
+                  core.info(`  Blocker #${completedIssueNumber} reopened — moving #${issue.number} back to Blocked`);
                   await setStatus(projectId, statusFieldId, item.id, STATUS.BLOCKED, issue.number);
                 }
               }
