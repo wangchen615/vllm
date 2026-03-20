@@ -18,7 +18,7 @@ This RFC proposed a mechanism to dynamically scale the number of concurrent LoRA
 standalone vLLM plugin (`vllm-lora-scaler`) that exposes a REST endpoint
 `POST /v1/scale_max_loras`.
 
-**Authors:** Yue Zhu (yuezhu1)
+**Authors:** Yue Zhu ([@yuezhu1](https://github.com/yuezhu1))
 **Created:** 2026-03-19
 
 ---

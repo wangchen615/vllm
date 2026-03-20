@@ -1,6 +1,6 @@
 # RFC: Dynamic LoRA GPU Capacity
 
-- **Authors**: Chen Wang (wangchen615), Yue Zhu (yuezhu1)
+- **Authors**: Chen Wang ([@wangchen615](https://github.com/wangchen615)), Yue Zhu ([@yuezhu1](https://github.com/yuezhu1))
 - **Status**: Draft
 - **Created**: 2026-03-19
 - **Related**: [LoRA Resolver Plugins](../lora_resolver_plugins.md),
