@@ -79,7 +79,9 @@ Several vLLM capabilities make dynamic LoRA capacity tractable:
 - **kvcached co-deployment**: LoRA capacity and KV cache capacity share GPU memory
   cooperatively rather than competing with fixed allocations.
 - **Traffic bursts**: Scale from 4 → 16 LoRA slots when demand spikes, back to 4 afterwards.
-- **Hot-adapter rotation**: `load_inplace=True` already supports manually swapping a LoRA
+- **Hot-adapter rotation**: `load_inplace=True` hot-swaps a LoRA into an existing slot.
+  This RFC adds automatic slot scaling so the resolver can grow/shrink the slot pool and
+  evict cold adapters without operator intervention.
   into an existing slot. This RFC adds automatic slot scaling so the resolver can evict
   cold adapters and load hot ones without operator intervention.
 - **Multi-LoRA applications**: A single application managing a dynamic pool of LoRAs — e.g.,
