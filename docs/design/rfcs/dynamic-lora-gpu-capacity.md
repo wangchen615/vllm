@@ -84,7 +84,9 @@ Several vLLM capabilities make dynamic LoRA capacity tractable:
   evict cold adapters without operator intervention.
   into an existing slot. This RFC adds automatic slot scaling so the resolver can evict
   cold adapters and load hot ones without operator intervention.
-- **Multi-LoRA applications**: A single application managing a dynamic pool of LoRAs — e.g.,
+- **Multi-LoRA applications**: A single app managing a dynamic pool of LoRAs (per-task,
+  per-language, or per-user) where only the active subset occupies GPU slots and the
+  pool grows or shrinks without restarting the server.
   per-task, per-language, or per-user adapters — where only the active subset needs GPU slots
   at any time, and the pool grows or shrinks without restarting the server.
 - **Cost efficiency**: Run more LoRA variants on the same GPU by dynamically time-sharing
