@@ -39,6 +39,19 @@ class LoRAResolver(ABC):
         """
         pass
 
+    async def get_desired_lora_slots(
+        self,
+        current_slots: int,
+        active_loras: list[str],
+        free_gpu_memory_bytes: int,
+        total_gpu_memory_bytes: int,
+    ) -> int | None:
+        """Optional policy hook. Return desired GPU slot count, or None to keep
+        current. Called by engine between batches when dynamic_lora_slots=True.
+        Returned value is clamped to [min_loras, max_loras] by the engine.
+        """
+        return None
+
 
 @dataclass
 class _LoRAResolverRegistry:
