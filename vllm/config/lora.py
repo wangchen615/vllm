@@ -70,6 +70,34 @@ class LoRAConfig:
     memory usage. Only takes effect when cudagraph_specialize_lora is True.
     """
 
+    # --- Dynamic LoRA slot scaling fields ---
+
+    min_loras: int = Field(default=1, ge=1)
+    """Minimum number of LoRA GPU slots. Acts as the floor when dynamic
+    resizing shrinks the slot count. Must be >= 1 and <= max_loras.
+    Only meaningful when dynamic_lora_slots=True."""
+
+    dynamic_lora_slots: bool = False
+    """Enable automatic dynamic resizing of GPU LoRA slots at runtime.
+    When True, max_loras becomes the initial value and upper bound for
+    automatic scaling. Operator-triggered scaling via
+    POST /v1/scale_max_loras is always available regardless of this flag."""
+
+    lora_mem_high_watermark: float = Field(default=0.8, gt=0.0, lt=1.0)
+    """GPU memory utilization fraction above which LoRA slots are
+    proactively reduced. Must be in (0, 1) and greater than
+    lora_mem_low_watermark. Only used when dynamic_lora_slots=True."""
+
+    lora_mem_low_watermark: float = Field(default=0.5, gt=0.0, lt=1.0)
+    """GPU memory utilization fraction below which LoRA slots may be
+    expanded. Must be in (0, 1) and less than lora_mem_high_watermark.
+    Only used when dynamic_lora_slots=True."""
+
+    lora_slot_resize_cooldown_s: float = Field(default=1.0, ge=0.0)
+    """Minimum seconds between consecutive automatic LoRA slot resizes.
+    Prevents thrashing when memory utilization oscillates near a watermark.
+    Only used when dynamic_lora_slots=True."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -92,6 +120,8 @@ class LoRAConfig:
         factors.append(
             tuple(sorted(self.target_modules)) if self.target_modules else None
         )
+        # dynamic_lora_slots disables LoRA cudagraph specialization
+        factors.append(self.dynamic_lora_slots)
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
@@ -105,6 +135,20 @@ class LoRAConfig:
                 f"max_cpu_loras ({self.max_cpu_loras}) must be >= "
                 f"max_loras ({self.max_loras})."
             )
+
+        if self.dynamic_lora_slots:
+            if self.min_loras > self.max_loras:
+                raise ValueError(
+                    f"min_loras ({self.min_loras}) must be <= "
+                    f"max_loras ({self.max_loras})."
+                )
+            if self.lora_mem_low_watermark >= self.lora_mem_high_watermark:
+                raise ValueError(
+                    "lora_mem_low_watermark must be less than "
+                    "lora_mem_high_watermark, both in (0, 1). Got "
+                    f"{self.lora_mem_low_watermark} >= "
+                    f"{self.lora_mem_high_watermark}."
+                )
 
         return self
 
