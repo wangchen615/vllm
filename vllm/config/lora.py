@@ -74,14 +74,15 @@ class LoRAConfig:
 
     min_loras: int = Field(default=1, ge=1)
     """Minimum number of LoRA GPU slots. Acts as the floor when dynamic
-    resizing shrinks the slot count. Must be >= 1 and <= max_loras.
-    Only meaningful when dynamic_lora_slots=True."""
+    resizing shrinks the slot count. Must be >= 1. When dynamic_lora_slots
+    is True, min_loras must also be <= max_loras, enforced at construction
+    time. Has no effect when dynamic_lora_slots=False."""
 
     dynamic_lora_slots: bool = False
     """Enable automatic dynamic resizing of GPU LoRA slots at runtime.
     When True, max_loras becomes the initial value and upper bound for
-    automatic scaling. Operator-triggered scaling via
-    POST /v1/scale_max_loras is always available regardless of this flag."""
+    automatic scaling. Operator-triggered scaling is independent of this
+    flag and will be supported via a plugin (see issue #16)."""
 
     lora_mem_high_watermark: float = Field(default=0.8, gt=0.0, lt=1.0)
     """GPU memory utilization fraction above which LoRA slots are
@@ -120,8 +121,12 @@ class LoRAConfig:
         factors.append(
             tuple(sorted(self.target_modules)) if self.target_modules else None
         )
-        # dynamic_lora_slots disables LoRA cudagraph specialization
+        # TODO(#14): dynamic_lora_slots will disable LoRA cudagraph specialization
+        # once that behavior is implemented.
         factors.append(self.dynamic_lora_slots)
+        factors.append(
+            self.specialize_active_lora
+        )  # affects which cuda graphs are captured
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str

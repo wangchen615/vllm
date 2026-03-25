@@ -149,6 +149,12 @@ def test_compute_hash_differs_with_dynamic_flag():
     assert cfg_static.compute_hash() != cfg_dynamic.compute_hash()
 
 
+def test_compute_hash_differs_with_specialize_active_lora():
+    cfg_off = LoRAConfig(max_loras=4, specialize_active_lora=False)
+    cfg_on = LoRAConfig(max_loras=4, specialize_active_lora=True)
+    assert cfg_off.compute_hash() != cfg_on.compute_hash()
+
+
 def test_compute_hash_stable():
     cfg = LoRAConfig(max_loras=4, dynamic_lora_slots=True)
     assert cfg.compute_hash() == cfg.compute_hash()
