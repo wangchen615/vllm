@@ -66,6 +66,40 @@ class BaseLayerWithLoRA(nn.Module):
     ):
         self.punica_wrapper: PunicaWrapperBase = punica_wrapper
 
+    def reallocate_lora_weights(self, new_slots: int) -> None:
+        """Reallocate lora_a_stacked / lora_b_stacked for new_slots.
+
+        - Preserves weights for surviving slots (min(old, new) slots).
+        - No-op if layer has no lora tensors.
+        - Does NOT call torch.cuda.empty_cache() — caller does this once
+          after all layers.
+        """
+        lora_a_stacked: torch.Tensor | tuple[torch.Tensor, ...] | None = getattr(
+            self, "lora_a_stacked", None
+        )
+        lora_b_stacked: torch.Tensor | tuple[torch.Tensor, ...] | None = getattr(
+            self, "lora_b_stacked", None
+        )
+        if lora_a_stacked is None or lora_b_stacked is None:
+            return
+
+        def _reallocate(
+            stacked: torch.Tensor | tuple[torch.Tensor, ...],
+        ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+            is_tuple = isinstance(stacked, tuple)
+            tensors = stacked if is_tuple else (stacked,)
+            surviving = min(tensors[0].shape[0], new_slots)
+            new_tensors = tuple(
+                torch.zeros(new_slots, *t.shape[1:], dtype=t.dtype, device=t.device)
+                for t in tensors
+            )
+            for new_t, old_t in zip(new_tensors, tensors):
+                new_t[:surviving].copy_(old_t[:surviving])
+            return new_tensors if is_tuple else new_tensors[0]
+
+        self.lora_a_stacked = _reallocate(lora_a_stacked)
+        self.lora_b_stacked = _reallocate(lora_b_stacked)
+
     @classmethod
     def can_replace_layer(
         cls,
