@@ -524,6 +524,72 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.w2_lora_b_stacked[0][index] = 0
         self.adapter_enabled[index] = 0
 
+    def reallocate_lora_weights(self, new_slots: int) -> None:
+        if not hasattr(self, "w13_lora_a_stacked"):
+            return
+
+        def _reallocate(
+            stacked: tuple[torch.Tensor, ...],
+        ) -> tuple[torch.Tensor, ...]:
+            surviving = min(stacked[0].shape[0], new_slots)
+            new_tensors = tuple(
+                torch.zeros(new_slots, *t.shape[1:], dtype=t.dtype, device=t.device)
+                for t in stacked
+            )
+            for new_t, old_t in zip(new_tensors, stacked):
+                new_t[:surviving].copy_(old_t[:surviving])
+            return new_tensors
+
+        new_w13_a = _reallocate(self.w13_lora_a_stacked)
+        new_w13_b = _reallocate(self.w13_lora_b_stacked)
+        new_w2_a = _reallocate(self.w2_lora_a_stacked)
+        new_w2_b = _reallocate(self.w2_lora_b_stacked)
+
+        # Resize adapter_enabled: (old_max_loras + 1,) -> (new_slots + 1,)
+        surviving_enabled = min(self.adapter_enabled.shape[0], new_slots + 1)
+        new_adapter_enabled = torch.zeros(
+            new_slots + 1,
+            dtype=self.adapter_enabled.dtype,
+            device=self.adapter_enabled.device,
+        )
+        new_adapter_enabled[:surviving_enabled].copy_(
+            self.adapter_enabled[:surviving_enabled]
+        )
+
+        self.w13_lora_a_stacked = new_w13_a
+        self.w13_lora_b_stacked = new_w13_b
+        self.w2_lora_a_stacked = new_w2_a
+        self.w2_lora_b_stacked = new_w2_b
+        self.adapter_enabled = new_adapter_enabled
+
+        # Rebuild the flat lora_a_stacked / lora_b_stacked views
+        self.lora_a_stacked = []
+        self.lora_b_stacked = []
+        for lora_id in range(new_slots):
+            for experts_id in range(self.base_layer.local_num_experts):
+                self.lora_a_stacked.append(
+                    self.w13_lora_a_stacked[0][lora_id][experts_id]
+                )
+                self.lora_a_stacked.append(
+                    self.w2_lora_a_stacked[0][lora_id][experts_id]
+                )
+                self.lora_b_stacked.append(
+                    self.w13_lora_b_stacked[0][lora_id][experts_id]
+                )
+                self.lora_b_stacked.append(
+                    self.w2_lora_b_stacked[0][lora_id][experts_id]
+                )
+                if self._w13_slices == 2:
+                    self.lora_a_stacked.append(
+                        self.w13_lora_a_stacked[1][lora_id][experts_id]
+                    )
+                    self.lora_b_stacked.append(
+                        self.w13_lora_b_stacked[1][lora_id][experts_id]
+                    )
+
+        # Keep max_loras in sync so MoE kernels use the correct value
+        self.max_loras = new_slots
+
     #
 
     def set_lora(
