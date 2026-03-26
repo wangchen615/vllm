@@ -82,7 +82,7 @@ jobs:
                             ... on Issue {
                               number
                               state
-                              blockedByIssues(first: 20) {
+                              blockedBy(first: 20) {
                                 nodes { number state }
                               }
                             }
@@ -124,7 +124,7 @@ jobs:
 
             for (const item of blockedItems) {
               const issue = item.content;
-              const blockers = issue.blockedByIssues.nodes;
+              const blockers = issue.blockedBy.nodes;
 
               if (eventType === 'closed') {
                 // All blockers must be closed for this issue to become Ready
