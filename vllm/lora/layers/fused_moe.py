@@ -556,9 +556,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             self.adapter_enabled[:surviving_enabled]
         )
 
-        del self.w13_lora_a_stacked, self.w13_lora_b_stacked
-        del self.w2_lora_a_stacked, self.w2_lora_b_stacked
-        del self.adapter_enabled
         self.w13_lora_a_stacked = new_w13_a
         self.w13_lora_b_stacked = new_w13_b
         self.w2_lora_a_stacked = new_w2_a
