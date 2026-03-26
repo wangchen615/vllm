@@ -33,6 +33,13 @@ jobs:
               READY:   'ab7c1b26',
             };
 
+            // Guard: this job only makes sense for issue events.
+            // The job-level `if:` is bypassed on re-runs, so check here too.
+            if (context.eventName !== 'issues' || !context.payload.issue) {
+              core.info(`Skipping: event is '${context.eventName}', not 'issues'.`);
+              return;
+            }
+
             const completedIssueNumber = context.payload.issue.number;
             const eventType = context.payload.action; // 'closed' or 'reopened'
             core.info(`Trigger: issue #${completedIssueNumber} was ${eventType}`);
