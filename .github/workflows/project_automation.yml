@@ -14,8 +14,8 @@ jobs:
   unblock-ready:
     name: Move unblocked issues to Ready
     runs-on: ubuntu-latest
-    # Only run for issues in our fork (not upstream syncs)
-    if: github.repository == 'wangchen615/vllm'
+    # Only run for issue events in our fork (not PR events or upstream syncs)
+    if: github.event_name == 'issues' && github.repository == 'wangchen615/vllm'
     steps:
       - name: Promote unblocked issues to Ready
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd  # v8.0.0
