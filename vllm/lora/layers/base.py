@@ -97,8 +97,8 @@ class BaseLayerWithLoRA(nn.Module):
                 new_t[:surviving].copy_(old_t[:surviving])
             return new_tensors if is_tuple else new_tensors[0]
 
-        self.lora_a_stacked = _reallocate(lora_a_stacked)
-        self.lora_b_stacked = _reallocate(lora_b_stacked)
+        object.__setattr__(self, "lora_a_stacked", _reallocate(lora_a_stacked))
+        object.__setattr__(self, "lora_b_stacked", _reallocate(lora_b_stacked))
 
     @classmethod
     def can_replace_layer(
