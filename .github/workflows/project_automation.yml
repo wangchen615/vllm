@@ -15,7 +15,7 @@ jobs:
     name: Move unblocked issues to Ready
     runs-on: ubuntu-latest
     # Only run for issues in our fork (not upstream syncs)
-    if: github.event_name == 'issues' && github.repository == 'wangchen615/vllm'
+    if: github.repository == 'wangchen615/vllm'
     steps:
       - name: Promote unblocked issues to Ready
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd  # v8.0.0
@@ -60,21 +60,8 @@ jobs:
               return { projectId: pv2.id, statusFieldId: pv2.field.id };
             }
 
-            // Parse issue numbers from a "### Blocked By" section in the body.
-            // Matches lines like "- #10 (some description)" under that heading.
-            function parseBlockedBy(body) {
-              if (!body) return [];
-              const section = body.match(/###\s+Blocked By\s*\n([\s\S]*?)(?=\n###|\n##|$)/i);
-              if (!section) return [];
-              const nums = [];
-              for (const m of section[1].matchAll(/#(\d+)/g)) {
-                nums.push(parseInt(m[1], 10));
-              }
-              return nums;
-            }
-
-            // Fetch all items on the project that are currently Blocked,
-            // along with their issue body so we can parse "### Blocked By".
+            // Fetch all open issues on the project that are currently Blocked,
+            // along with their blocking issues.
             async function getBlockedItems(projectId) {
               const data = await graphql(`
                 query($projectId: ID!) {
@@ -95,7 +82,9 @@ jobs:
                             ... on Issue {
                               number
                               state
-                              body
+                              blockedByIssues(first: 20) {
+                                nodes { number state }
+                              }
                             }
                           }
                         }
@@ -104,29 +93,13 @@ jobs:
                   }
                 }`, { projectId });
 
-              return data.node.items.nodes
-                .filter(item => {
-                  if (!item.content || item.content.state !== 'OPEN') return false;
-                  const statusField = item.fieldValues.nodes.find(
-                    v => v.field && v.field.name === 'Status'
-                  );
-                  return statusField && statusField.optionId === STATUS.BLOCKED;
-                })
-                .map(item => ({
-                  ...item,
-                  blockedBy: parseBlockedBy(item.content.body),
-                }));
-            }
-
-            // Fetch the open/closed state of a single issue by number.
-            async function getIssueState(issueNumber) {
-              const data = await graphql(`
-                query($owner: String!, $repo: String!, $number: Int!) {
-                  repository(owner: $owner, name: $repo) {
-                    issue(number: $number) { state }
-                  }
-                }`, { owner: OWNER, repo: 'vllm', number: issueNumber });
-              return data.repository.issue.state; // 'OPEN' | 'CLOSED'
+              return data.node.items.nodes.filter(item => {
+                if (!item.content || item.content.__typename === 'DraftIssue') return false;
+                const statusField = item.fieldValues.nodes.find(
+                  v => v.field && v.field.name === 'Status'
+                );
+                return statusField && statusField.optionId === STATUS.BLOCKED;
+              });
             }
 
             // Set the Status field of a project item
@@ -151,21 +124,20 @@ jobs:
 
             for (const item of blockedItems) {
               const issue = item.content;
-              const blockerNums = item.blockedBy;
-              core.info(`Issue #${issue.number} blocked by: [${blockerNums.join(', ')}]`);
+              const blockers = issue.blockedByIssues.nodes;
 
               if (eventType === 'closed') {
-                // Fetch live state for each blocker and count how many are still open
-                const states = await Promise.all(blockerNums.map(n => getIssueState(n)));
-                const openCount = states.filter(s => s === 'OPEN').length;
-                core.info(`Issue #${issue.number}: ${openCount} open blocker(s) remaining`);
-                if (openCount === 0) {
+                // All blockers must be closed for this issue to become Ready
+                const openBlockers = blockers.filter(b => b.state === 'OPEN');
+                core.info(`Issue #${issue.number}: ${openBlockers.length} open blocker(s) remaining`);
+                if (openBlockers.length === 0) {
                   core.info(`  All blockers resolved — promoting #${issue.number} to Ready`);
                   await setStatus(projectId, statusFieldId, item.id, STATUS.READY, issue.number);
                 }
               } else if (eventType === 'reopened') {
-                // If the reopened issue is listed as a blocker, move back to Blocked
-                if (blockerNums.includes(completedIssueNumber)) {
+                // If the reopened issue is a blocker of this one, move it back to Blocked
+                const isBlocker = blockers.some(b => b.number === completedIssueNumber);
+                if (isBlocker) {
                   core.info(`  Blocker #${completedIssueNumber} reopened — moving #${issue.number} back to Blocked`);
                   await setStatus(projectId, statusFieldId, item.id, STATUS.BLOCKED, issue.number);
                 }
