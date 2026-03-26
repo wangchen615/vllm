@@ -305,18 +305,6 @@ def build_app(
             )
 
     app = sagemaker_standards_bootstrap(app)
-
-    # Load router plugins — external packages that attach additional HTTP
-    # endpoints to the vLLM server by registering under the
-    # "vllm.router_plugins" entry point group.
-    # Each entry point must be a callable that accepts a FastAPI app:
-    #   def attach_router(app: FastAPI) -> None: ...
-    from vllm.plugins import load_plugins_by_group
-    router_plugins = load_plugins_by_group("vllm.router_plugins")
-    for name, attach_fn in router_plugins.items():
-        logger.debug("Attaching router plugin: %s", name)
-        attach_fn(app)
-
     return app
 
 
