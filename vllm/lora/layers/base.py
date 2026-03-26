@@ -71,8 +71,7 @@ class BaseLayerWithLoRA(nn.Module):
 
         - Preserves weights for surviving slots (min(old, new) slots).
         - No-op if layer has no lora tensors.
-        - Does NOT call torch.cuda.empty_cache() — caller does this once
-          after all layers.
+        - Does NOT call empty_cache() — caller does this once after all layers.
         """
         lora_a_stacked: torch.Tensor | tuple[torch.Tensor, ...] | None = getattr(
             self, "lora_a_stacked", None
