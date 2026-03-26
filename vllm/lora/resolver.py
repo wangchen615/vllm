@@ -39,6 +39,42 @@ class LoRAResolver(ABC):
         """
         pass
 
+    async def get_desired_lora_slots(
+        self,
+        current_slots: int,
+        active_loras: list[str],
+        free_gpu_memory_bytes: int,
+        total_gpu_memory_bytes: int,
+    ) -> int | None:
+        """Optional policy hook for dynamic LoRA slot sizing.
+
+        Called by the engine between batches when ``dynamic_lora_slots=True``.
+        Implementations may use the current number of slots, the set of active
+        LoRA adapters, and available GPU memory to decide how many LoRA slots
+        should be allocated. The engine will clamp the returned value to the
+        configured ``[min_loras, max_loras]`` range.
+
+        Args:
+            current_slots: The current number of LoRA slots allocated by the
+                engine.
+            active_loras: A list of adapter names for LoRA adapters that are
+                currently active or scheduled on this engine. Each entry
+                corresponds to a distinct adapter; ordering is
+                implementation-defined and should not be relied upon.
+            free_gpu_memory_bytes: The current estimate of free GPU memory,
+                in bytes, available for allocating additional LoRA adapters
+                on this worker.
+            total_gpu_memory_bytes: The total GPU memory capacity, in bytes,
+                on this worker.
+
+        Returns:
+            Optional[int]: The desired total number of LoRA slots. If an
+            integer is returned, the engine will adjust the number of slots
+            (after clamping to ``[min_loras, max_loras]``). If ``None`` is
+            returned, the engine will keep ``current_slots`` unchanged.
+        """
+        return None
+
 
 @dataclass
 class _LoRAResolverRegistry:
