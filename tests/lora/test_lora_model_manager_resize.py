@@ -78,7 +78,7 @@ def test_raises_on_zero_slots():
 
 def test_noop_when_size_unchanged():
     manager = _make_base_manager()
-    with patch("torch.cuda.empty_cache") as mock_empty:
+    with patch("torch.accelerator.empty_cache") as mock_empty:
         manager.resize_lora_slots(INITIAL_SLOTS)
     mock_empty.assert_not_called()
     for mod in manager.modules.values():
@@ -89,7 +89,7 @@ def test_noop_when_size_unchanged():
 def test_grow_adds_empty_slots():
     manager = _make_base_manager()
     manager.lora_index_to_id = [10, None, None, None]
-    with patch("torch.cuda.empty_cache"):
+    with patch("torch.accelerator.empty_cache"):
         manager.resize_lora_slots(8)
     # _lora_slots updated, lora_config.max_loras unchanged
     assert manager._lora_slots == 8
@@ -108,7 +108,7 @@ def test_shrink_evicts_lru_adapters():
     # Add adapters in order: 1 (oldest) → 4 (newest)
     for i in range(1, 5):
         manager._active_adapters[i] = None
-    with patch("torch.cuda.empty_cache"):
+    with patch("torch.accelerator.empty_cache"):
         manager.resize_lora_slots(2)
     # Oldest two (1, 2) evicted; newest two (3, 4) survive
     assert 1 not in manager._active_adapters
@@ -132,6 +132,6 @@ def test_base_shrink_raises_when_active_adapters_overflow():
 
 def test_empty_cache_called_once():
     manager = _make_base_manager(n_modules=4)
-    with patch("torch.cuda.empty_cache") as mock_empty:
+    with patch("torch.accelerator.empty_cache") as mock_empty:
         manager.resize_lora_slots(8)
     mock_empty.assert_called_once()

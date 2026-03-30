@@ -350,7 +350,7 @@ class LoRAModelManager:
 
         for module in self.modules.values():
             module.reallocate_lora_weights(new_slots)
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
 
         if new_slots > self.lora_slots:
             self.lora_index_to_id.extend([None] * (new_slots - self.lora_slots))
