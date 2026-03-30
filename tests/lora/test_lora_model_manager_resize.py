@@ -8,7 +8,6 @@ Tests run without GPU — all LoRA layer operations are mocked.
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
-import torch
 
 from vllm.config.lora import LoRAConfig
 from vllm.lora.model_manager import (
