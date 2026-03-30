@@ -25,7 +25,7 @@ STAT_LOGGER_PLUGINS_GROUP = "vllm.stat_logger_plugins"
 plugins_loaded = False
 
 
-def load_plugins_by_group(group: str) -> dict[str, Callable[[], Any]]:
+def load_plugins_by_group(group: str) -> dict[str, Callable[..., Any]]:
     """Load plugins registered under the given entry point group."""
     from importlib.metadata import entry_points
 
@@ -51,7 +51,7 @@ def load_plugins_by_group(group: str) -> dict[str, Callable[[], Any]]:
             "Set `VLLM_PLUGINS` to control which plugins to load."
         )
 
-    plugins = dict[str, Callable[[], Any]]()
+    plugins = dict[str, Callable[..., Any]]()
     for plugin in discovered_plugins:
         if allowed_plugins is None or plugin.name in allowed_plugins:
             if allowed_plugins is not None:
