@@ -8,6 +8,7 @@ Tests run without GPU — all LoRA layer operations are mocked.
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
+import torch
 
 from vllm.config.lora import LoRAConfig
 from vllm.lora.model_manager import (
@@ -46,6 +47,7 @@ def _make_base_manager(n_modules: int = 2) -> LoRAModelManager:
     manager._evict_adapters_to_fit = LoRAModelManager._evict_adapters_to_fit.__get__(
         manager
     )
+    manager._compact_slots = LoRAModelManager._compact_slots.__get__(manager)
     manager.resize_lora_slots = LoRAModelManager.resize_lora_slots.__get__(manager)
     return manager
 
@@ -57,8 +59,8 @@ def _make_lru_manager(n_modules: int = 2) -> LRUCacheLoRAModelManager:
     manager._lora_slots = INITIAL_SLOTS
     manager.lora_index_to_id = [None] * INITIAL_SLOTS
     manager.modules = {f"mod_{i}": _make_mock_module() for i in range(n_modules)}
-    manager._active_adapters = LoRALRUCache(INITIAL_SLOTS, lambda lora_id: None)
-    manager._deactivate_adapter = MagicMock()
+    manager._deactivate_adapter = LoRAModelManager._deactivate_adapter.__get__(manager)
+    manager._active_adapters = LoRALRUCache(INITIAL_SLOTS, manager._deactivate_adapter)
     # lora_slots is a property backed by _lora_slots; wire it up
     type(manager).lora_slots = PropertyMock(
         side_effect=lambda self=manager: self._lora_slots
@@ -66,6 +68,7 @@ def _make_lru_manager(n_modules: int = 2) -> LRUCacheLoRAModelManager:
     manager._evict_adapters_to_fit = (
         LRUCacheLoRAModelManager._evict_adapters_to_fit.__get__(manager)
     )
+    manager._compact_slots = LoRAModelManager._compact_slots.__get__(manager)
     manager.resize_lora_slots = LoRAModelManager.resize_lora_slots.__get__(manager)
     return manager
 
@@ -108,6 +111,8 @@ def test_shrink_evicts_lru_adapters():
     # Add adapters in order: 1 (oldest) → 4 (newest)
     for i in range(1, 5):
         manager._active_adapters[i] = None
+    # Survivors 3 and 4 are in high slots; compaction must move them to 0, 1
+    manager.lora_index_to_id = [1, 2, 3, 4]
     with patch("torch.accelerator.empty_cache"):
         manager.resize_lora_slots(2)
     # Oldest two (1, 2) evicted; newest two (3, 4) survive
@@ -119,6 +124,8 @@ def test_shrink_evicts_lru_adapters():
     assert manager._active_adapters.capacity == 2
     assert manager._lora_slots == 2
     assert len(manager.lora_index_to_id) == 2
+    # Survivors compacted into low slots
+    assert manager.lora_index_to_id == [3, 4]
     for mod in manager.modules.values():
         mod.reallocate_lora_weights.assert_called_once_with(2)
 
