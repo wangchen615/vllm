@@ -8,9 +8,8 @@ entry points, and no fully-constructed args namespace are required.
 """
 
 import logging
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
-import pytest
 from fastapi import FastAPI
 
 
@@ -43,7 +42,7 @@ def _run_plugin_attachment(monkeypatch, plugins: dict):
 
 
 def test_no_plugins_installed(monkeypatch):
-    """No-op when no router plugins are registered; app is still a valid FastAPI instance."""
+    """No-op when no router plugins are registered; app is a valid FastAPI instance."""
     app = _run_plugin_attachment(monkeypatch, plugins={})
     assert isinstance(app, FastAPI)
 
