@@ -8,8 +8,6 @@ setup(
     version="0.1",
     packages=["vllm_add_dummy_router"],
     entry_points={
-        "vllm.router_plugins": [
-            "dummy_router = vllm_add_dummy_router:attach_router"
-        ]
+        "vllm.router_plugins": ["dummy_router = vllm_add_dummy_router:attach_router"]
     },
 )
