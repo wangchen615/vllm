@@ -55,6 +55,7 @@ from vllm.entrypoints.utils import (
     process_lora_modules,
 )
 from vllm.logger import init_logger
+from vllm.plugins import load_plugins_by_group
 from vllm.reasoning import ReasoningParserManager
 from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.tool_parsers import ToolParserManager
@@ -305,6 +306,20 @@ def build_app(
             )
 
     app = sagemaker_standards_bootstrap(app)
+
+    # Load router plugins — external packages that attach additional HTTP
+    # endpoints to the vLLM server by registering under the
+    # "vllm.router_plugins" entry point group.
+    # Each entry point must be a callable that accepts a FastAPI app:
+    #   def attach_router(app: FastAPI) -> None: ...
+    router_plugins = load_plugins_by_group("vllm.router_plugins")
+    for name, attach_fn in router_plugins.items():
+        logger.debug("Attaching router plugin: %s", name)
+        try:
+            attach_fn(app)  # type: ignore[call-arg]
+        except Exception:
+            logger.exception("Failed to attach router plugin: %s", name)
+
     return app
 
 
