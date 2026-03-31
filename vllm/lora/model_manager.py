@@ -95,6 +95,9 @@ class LoRAModelManager:
         self._active_adapters: dict[int, None] = {}
         self.adapter_type = "LoRA"
         self.lora_config = lora_config
+        # Runtime slot count — decoupled from lora_config so dynamic scaling
+        # can adjust slots without mutating the original config object.
+        self._lora_slots: int = lora_config.max_loras
         self.device = device
         self.max_num_seqs = max_num_seqs
         assert self.capacity >= self.lora_slots
@@ -256,7 +259,7 @@ class LoRAModelManager:
 
     @property
     def lora_slots(self) -> int:
-        return self.lora_config.max_loras
+        return self._lora_slots
 
     @property
     def adapter_slots(self) -> int:
@@ -313,6 +316,92 @@ class LoRAModelManager:
     def _add_adapter(self, lora: LoRAModel):
         self._create_merged_loras_inplace(lora)
         self._registered_adapters[lora.id] = lora
+
+    def _evict_adapters_to_fit(self, new_slots: int) -> None:
+        """Evict active adapters until at most new_slots remain.
+
+        Base implementation raises if active adapters exceed new_slots —
+        the base class has no eviction policy. Subclasses with an eviction
+        policy (e.g. LRU) should override this.
+        """
+        if len(self._active_adapters) > new_slots:
+            raise ValueError(
+                f"Cannot shrink to {new_slots} slots: "
+                f"{len(self._active_adapters)} adapters are currently active. "
+                "Deactivate them first or use LRUCacheLoRAModelManager."
+            )
+
+    def _compact_slots(self) -> None:
+        """Compact surviving adapter weights into contiguous low slots.
+
+        When shrinking, surviving adapters may occupy high slot indices that
+        would be truncated by reallocate_lora_weights(). This method moves
+        their weights to slots 0..N-1 via GPU-to-GPU copies and updates
+        lora_index_to_id to reflect the new assignments.
+
+        Only called on shrink. Since new_idx <= old_idx always holds here
+        (survivors are packed toward lower indices), copies never overwrite
+        a slot that still needs to be read.
+        """
+        survivors = [
+            (old_idx, lora_id)
+            for old_idx, lora_id in enumerate(self.lora_index_to_id)
+            if lora_id is not None
+        ]
+        for new_idx, (old_idx, _) in enumerate(survivors):
+            if old_idx == new_idx:
+                continue
+            for module in self.modules.values():
+                for attr in ("lora_a_stacked", "lora_b_stacked"):
+                    stacked = getattr(module, attr, None)
+                    if stacked is None:
+                        continue
+                    tensors = stacked if isinstance(stacked, tuple) else (stacked,)
+                    for t in tensors:
+                        t[new_idx].copy_(t[old_idx])
+                        t[old_idx].zero_()
+        self.lora_index_to_id = [lora_id for _, lora_id in survivors]
+
+    def resize_lora_slots(self, new_slots: int) -> None:
+        """Resize the number of LoRA GPU slots.
+
+        Grows or shrinks the per-layer stacked weight tensors and updates
+        manager bookkeeping to match. On shrink, active adapters are evicted
+        down to new_slots via _evict_adapters_to_fit() before reallocation,
+        then surviving adapters are compacted into the lowest slots so that
+        reallocate_lora_weights() does not truncate their weights.
+
+        Args:
+            new_slots: The desired number of LoRA slots. Must be >= 1.
+        """
+        if new_slots <= 0:
+            raise ValueError(f"new_slots must be >= 1, got {new_slots}.")
+        if new_slots == self.lora_slots:
+            return
+
+        self._evict_adapters_to_fit(new_slots)
+
+        if new_slots < self.lora_slots:
+            # Compact surviving adapter weights into low slots before truncation
+            self._compact_slots()
+
+        for module in self.modules.values():
+            module.reallocate_lora_weights(new_slots)
+        torch.accelerator.empty_cache()
+
+        if new_slots > self.lora_slots:
+            self.lora_index_to_id.extend([None] * (new_slots - self.lora_slots))
+        else:
+            self.lora_index_to_id = self.lora_index_to_id[:new_slots]
+
+        self._lora_slots = new_slots
+
+        # Reloading surviving adapters is intentionally omitted.
+        # _compact_slots() moves weights to low slots via GPU-to-GPU copy, and
+        # reallocate_lora_weights() preserves those slots. If this manager is
+        # ever extended to use a remote or distributed weight store,
+        # reallocation would produce empty tensors and surviving adapters would
+        # need to be explicitly reloaded here via activate_adapter().
 
     def pin_adapter(self, lora_id: int) -> bool:
         """Pin a LoRAModel in the manager cache."""
@@ -898,6 +987,15 @@ class LRUCacheLoRAModelManager(LoRAModelManager):
         # We always touch to update the LRU cache order
         self._active_adapters.touch(lora_id)
         return result
+
+    def _evict_adapters_to_fit(self, new_slots: int) -> None:
+        while len(self._active_adapters) > new_slots:
+            self._active_adapters.remove_oldest()
+        # cachetools maxsize is read-only; rebuild the cache with new capacity
+        new_cache = LoRALRUCache(new_slots, self._deactivate_adapter)
+        for key, value in self._active_adapters.cache.items():
+            new_cache[key] = value
+        self._active_adapters = new_cache
 
     def remove_oldest_adapter(self) -> bool:
         if len(self._registered_adapters) > 0:
