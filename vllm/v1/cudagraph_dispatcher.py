@@ -117,6 +117,13 @@ class CudagraphDispatcher:
             # No LoRA configured - single case with no LoRA
             return [0]
 
+        if lora_config.dynamic_lora_slots:
+            logger.warning(
+                "dynamic_lora_slots=True: disabling LoRA cudagraph "
+                "specialization. This may reduce throughput slightly."
+            )
+            return [0]
+
         # LoRA is enabled - capture graphs based on cudagraph_specialize_lora
         if self.compilation_config.cudagraph_specialize_lora:
             captured_counts = get_captured_lora_counts(
