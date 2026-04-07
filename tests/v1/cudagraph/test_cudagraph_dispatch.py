@@ -38,7 +38,7 @@ class SimpleMLP(nn.Module):
 def _create_vllm_config(
     compilation_config: CompilationConfig,
     max_num_seqs: int = 8,
-    lora_config: bool = False,
+    lora_config: bool | LoRAConfig = False,
 ) -> MagicMock:
     mock_config = MagicMock(spec=VllmConfig)
     mock_config.compilation_config = compilation_config
@@ -47,7 +47,9 @@ def _create_vllm_config(
     )
     mock_config.parallel_config = ParallelConfig()
     mock_config.speculative_config = None  # No speculative decoding
-    if not lora_config:
+    if isinstance(lora_config, LoRAConfig):
+        mock_config.lora_config = lora_config
+    elif not lora_config:
         mock_config.lora_config = None
     else:
         # Create a real LoRAConfig with specialize_active_lora enabled
@@ -263,6 +265,42 @@ class TestCudagraphDispatcher:
         # Don't initialize keys
 
         assert dispatcher.get_capture_descs() == []
+
+    def test_dynamic_lora_slots_disables_lora_cudagraphs(self):
+        """dynamic_lora_slots=True should return [0] from _get_lora_cases
+        and dispatch LoRA-active batches as CUDAGraphMode.NONE."""
+        comp_config = CompilationConfig(
+            cudagraph_mode="PIECEWISE",
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_capture_sizes=[1, 8],
+        )
+        config = _create_vllm_config(
+            comp_config,
+            max_num_seqs=8,
+            lora_config=LoRAConfig(
+                max_loras=4,
+                dynamic_lora_slots=True,
+                specialize_active_lora=True,
+            ),
+        )
+        dispatcher = CudagraphDispatcher(config)
+
+        # _get_lora_cases should return [0] (no LoRA specialization)
+        assert dispatcher._get_lora_cases() == [0]
+
+        dispatcher.initialize_cudagraph_keys(
+            cudagraph_mode=comp_config.cudagraph_mode,
+            uniform_decode_query_len=1,
+        )
+
+        # Only no-LoRA keys: 2 sizes × 1 lora_case = 2 keys
+        assert len(dispatcher.cudagraph_keys[CUDAGraphMode.PIECEWISE]) == 2
+
+        # LoRA-active batch should fall back to NONE
+        rt_mode, _ = dispatcher.dispatch(
+            num_tokens=8, uniform_decode=False, has_lora=True
+        )
+        assert rt_mode == CUDAGraphMode.NONE
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
