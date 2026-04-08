@@ -141,3 +141,30 @@ def test_empty_cache_called_once():
     with patch("torch.accelerator.empty_cache") as mock_empty:
         manager.resize_lora_slots(8)
     mock_empty.assert_called_once()
+
+
+# --- WorkerLoRAManager delegation tests ---
+
+
+def test_worker_manager_resize_delegates():
+    """WorkerLoRAManager.resize_lora_slots delegates to _adapter_manager."""
+    from vllm.lora.worker_manager import WorkerLoRAManager
+
+    worker = MagicMock(spec=WorkerLoRAManager)
+    worker._adapter_manager = MagicMock()
+    worker._adapter_manager.resize_lora_slots = MagicMock()
+    # Bind the real method
+    worker.resize_lora_slots = WorkerLoRAManager.resize_lora_slots.__get__(worker)
+    worker.resize_lora_slots(8)
+    worker._adapter_manager.resize_lora_slots.assert_called_once_with(8)
+
+
+def test_worker_manager_lora_slots_delegates():
+    """WorkerLoRAManager.lora_slots reflects _adapter_manager.lora_slots."""
+    from vllm.lora.worker_manager import WorkerLoRAManager
+
+    worker = MagicMock(spec=WorkerLoRAManager)
+    worker._adapter_manager = MagicMock()
+    type(worker._adapter_manager).lora_slots = PropertyMock(return_value=6)
+    # Bind the real property
+    assert WorkerLoRAManager.lora_slots.fget(worker) == 6

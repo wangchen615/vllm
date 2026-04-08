@@ -247,6 +247,14 @@ class WorkerLoRAManager:
     def list_adapters(self) -> set[int]:
         return set(self._adapter_manager.list_adapters())
 
+    def resize_lora_slots(self, new_slots: int) -> None:
+        """Resize GPU LoRA slots. Called by engine via collective RPC."""
+        self._adapter_manager.resize_lora_slots(new_slots)
+
+    @property
+    def lora_slots(self) -> int:
+        return self._adapter_manager.lora_slots
+
 
 class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
     """WorkerLoRAManager that manages LoRA models on the worker side.
