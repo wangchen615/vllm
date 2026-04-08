@@ -117,6 +117,17 @@ class CudagraphDispatcher:
             # No LoRA configured - single case with no LoRA
             return [0]
 
+        # Dynamic slots reallocate LoRA tensors, invalidating captured
+        # graph addresses.
+        if lora_config.dynamic_lora_slots:
+            logger.warning_once(
+                "dynamic_lora_slots=True: disabling CUDA graphs for LoRA "
+                "requests due to dynamic tensor reallocation. This "
+                "overrides cudagraph_specialize_lora and may reduce "
+                "throughput for LoRA-enabled requests."
+            )
+            return [0]
+
         # LoRA is enabled - capture graphs based on cudagraph_specialize_lora
         if self.compilation_config.cudagraph_specialize_lora:
             captured_counts = get_captured_lora_counts(
