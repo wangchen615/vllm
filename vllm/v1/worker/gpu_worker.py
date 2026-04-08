@@ -904,17 +904,15 @@ class Worker(WorkerBase):
 
     def resize_lora_slots(self, new_slots: int) -> None:
         """RPC target: resize LoRA slots on this worker."""
-        if hasattr(self.model_runner, "lora_manager") and (
-            self.model_runner.lora_manager is not None
-        ):
-            self.model_runner.lora_manager.resize_lora_slots(new_slots)
+        lora_manager = getattr(self.model_runner, "lora_manager", None)
+        if lora_manager is not None:
+            lora_manager.resize_lora_slots(new_slots)
 
     def get_lora_slots(self) -> int:
         """RPC target: return current LoRA slot count."""
-        if hasattr(self.model_runner, "lora_manager") and (
-            self.model_runner.lora_manager is not None
-        ):
-            return self.model_runner.lora_manager.lora_slots
+        lora_manager = getattr(self.model_runner, "lora_manager", None)
+        if lora_manager is not None:
+            return lora_manager.lora_slots
         return 0
 
     def check_health(self) -> None:
