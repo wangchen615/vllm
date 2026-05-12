@@ -15,31 +15,30 @@
 The `hillock-vmem` project aims for a **three-level memory hierarchy** for LLM KV cache:
 
 ```
-  GPU HBM  ←→  secondary-memory tier  ←→  CPU host memory
-  (smallest,                (larger & faster               (largest &
-   fastest,                  than host memory;              slowest,
-   closest)                  think CXL-attached,            most distant)
-                             near-accelerator vmem,
-                             NVLink-reachable DDR, etc.)
+  GPU HBM  ↔  secondary fast memory system  ↔  slow DRAM on host
+  (smallest,      (the novel tier —                 (largest,
+   fastest,        larger than HBM, faster           slowest,
+   closest)        than host DRAM to reach           most distant)
+                   from the accelerator)
 ```
 
-The middle tier — the "secondary memory" — is the novel piece. It's **larger than HBM, smaller than host memory, and faster than host memory to reach from the accelerator**. When the GPU's KV cache is full, we'd rather spill hot blocks to secondary memory (cheap reload) than all the way to host memory (expensive reload). When secondary memory is full, we cascade to host memory.
+The middle tier — the **secondary fast memory system** — is the novel piece. It's **larger than HBM, smaller than host DRAM, and faster than host DRAM to reach from the accelerator** (think CXL-attached memory, near-accelerator vmem, NVLink-reachable DDR). When the GPU's KV cache is full, we'd rather spill hot blocks to the secondary fast memory system (cheap reload) than all the way to slow DRAM on the host (expensive reload). When the secondary fast memory system is full, we cascade to slow host DRAM.
 
 ### Why this RFC uses two CPU pools
 
-We don't yet have the secondary-memory hardware available for vLLM testing. **M1 emulates the three-level hierarchy by using two separate CPU memory pools** as stand-ins for the secondary-memory tier and the host-memory tier. Both pools are just pinned host DRAM today, so there's no real latency asymmetry in M1 — the point of M1 is to prove that **vLLM's Simple KV-offload connector can be extended with small, well-scoped changes to manage two distinct address spaces** (allocation, eviction, exclusive placement, metadata, worker-side transfers, completion plumbing). Once that functional foundation is in place, swapping pool #0 to a real secondary-memory backing (NUMA-local pinned, CXL, vmem, etc.) is a contained change in the worker — the scheduler logic doesn't have to move.
+We don't yet have the secondary fast memory system hardware available for vLLM testing. **M1 emulates the three-level hierarchy by using two separate CPU memory pools** as stand-ins for the secondary fast memory system and the slow DRAM on host. Both pools are just pinned host DRAM today, so there's no real latency asymmetry in M1 — the point of M1 is to prove that **vLLM's Simple KV-offload connector can be extended with small, well-scoped changes to manage two distinct address spaces** (allocation, eviction, exclusive placement, metadata, worker-side transfers, completion plumbing). Once that functional foundation is in place, swapping pool #0 to a real secondary fast memory backing (NUMA-local pinned, CXL, vmem, etc.) is a contained change in the worker — the scheduler logic doesn't have to move.
 
 We considered vLLM's three existing offloading connectors before deciding to fork `SimpleCPUOffloadConnector`: `OffloadingConnector` has one CPU pool with pluggable LRU/ARC, `SimpleCPUOffloadConnector` has one CPU pool backed by a `BlockPool`, and `MultiConnector` only broadcasts saves to every child (no demotion, no exclusivity). `SimpleCPUOffloadConnector` (author: Yifan Qiao, `vllm/v1/simple_kv_offload/`, ~1350 LOC) has a clean dual-coordinator pattern (GPU + CPU `KVCacheCoordinator`) that extends naturally to a third coordinator, and its `DmaCopyBackend` has the pinned-memory / low-priority-stream plumbing we need.
 
 ### M1 goal
 
-Demonstrate that `SimpleCPUOffloadConnector` can manage **two CPU pools as two distinct address spaces**, in **eager mode with exclusive placement only**. In the terminology above: pool #0 is the emulated secondary-memory tier ("fast"), pool #1 is the emulated host-memory tier ("slow"). Both are pinned DRAM; asymmetric performance is deliberately out of scope — M1 measures *functional correctness* (blocks placed and migrated correctly, exclusive placement preserved, metadata + completion wiring works end-to-end), not throughput.
+Demonstrate that `SimpleCPUOffloadConnector` can manage **two CPU pools as two distinct address spaces**, in **eager mode with exclusive placement only**. In the terminology above: pool #0 is the emulated **secondary fast memory system** (referred to in the code as "fast"), pool #1 is the emulated **slow DRAM on host** (referred to in the code as "slow"). Both are pinned DRAM; asymmetric performance is deliberately out of scope — M1 measures *functional correctness* (blocks placed and migrated correctly, exclusive placement preserved, metadata + completion wiring works end-to-end), not throughput.
 
-What's explicitly not being claimed for M1: capacity additivity, prefix-miss speedup, or resiliency wins. Those follow from a real secondary-memory backing (and, for resiliency, from a different placement mode) — see "Future work" below.
+What's explicitly not being claimed for M1: capacity additivity, prefix-miss speedup, or resiliency wins. Those follow from a real secondary fast memory backing (and, for resiliency, from a different placement mode) — see "Relationship to the resiliency proposal" below.
 
 ### Design committed for M1
 
-- **Cascade**: Stores land in fast (emulated secondary). When fast is full, the LRU victim is **demoted** to slow (emulated host memory) via a CPU→CPU copy. When both are full, we drop the store silently (same as today's single-pool behavior at capacity).
+- **Cascade**: Stores land in fast (emulated secondary fast memory system). When fast is full, the LRU victim is **demoted** to slow (emulated slow DRAM on host) via a CPU→CPU copy. When both are full, we drop the store silently (same as today's single-pool behavior at capacity).
 - **Load**: Check fast first; fall back to slow. On slow hit, M1 serves from slow directly without promotion (promotion is a follow-up).
 - **Config**: Two explicit knobs in `kv_connector_extra_config`: `fast_cpu_bytes` and `slow_cpu_bytes`. Legacy `cpu_bytes_to_use` keeps working and maps to `fast_cpu_bytes` (slow defaults to 0 → single-pool behavior, fully backward compatible).
 
@@ -114,7 +113,7 @@ The net effect: from the allocator's perspective `get_new_blocks` still returns 
 
 ## Out of scope for M1
 
-- **Asymmetric performance between the two pools** — M1 is a functional emulation; both pools are pinned DRAM. Real secondary-memory backings (NUMA-local, CXL-attached, near-accelerator vmem, NVMe, etc.) are follow-up work.
+- **Asymmetric performance between the two pools** — M1 is a functional emulation; both pools are pinned DRAM. Real secondary fast memory backings (NUMA-local, CXL-attached, near-accelerator vmem, NVMe, etc.) are follow-up work.
 - **Placement modes other than `exclusive`** — `hybrid` and `replicate` motivate the resiliency proposal below. The config surface is shaped so adding a `placement_mode` knob later does not break existing configs.
 - **Resiliency (hot-failure detection & failover)** — see proposal below; M1 does not implement any of it.
 - Lazy mode tiering (keep lazy path single-pool or disabled when `slow_cpu_bytes>0`)
