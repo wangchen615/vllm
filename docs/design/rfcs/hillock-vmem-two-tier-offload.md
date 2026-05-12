@@ -122,50 +122,17 @@ The net effect: from the allocator's perspective `get_new_blocks` still returns 
 - HMA multi-group interaction (slow pool shares groups with fast → should Just Work but untested)
 - Metrics / observability — add only a log line per tier
 
-## Future work: resiliency proposal
+## Relationship to the resiliency proposal
 
-*Not implemented in M1.* Captured here because the motivation shapes the M1 abstractions — the code needs to land in a form this proposal can extend without re-plumbing.
+A companion RFC, [hillock-vmem-resiliency.md](hillock-vmem-resiliency.md), proposes how to exploit the hierarchy's natural redundancy to survive a memory-tier failure mid-serve. That proposal has its own motivation, placement modes (`exclusive` / `hybrid` / `replicate`), failure model (hot failure), and mechanism stack (detect / failover / quarantine / re-replicate). It is **not** scheduled for M1.
 
-### Motivation
+What M1 must *not* foreclose so the resiliency proposal remains cheap to land later:
 
-A real three-level memory hierarchy (GPU HBM ↔ secondary memory ↔ host memory) isn't just a performance win — it's **naturally redundant**. When either the secondary tier or the host tier hiccups, the other tier already holds (some of) the same KV data. The system should exploit this redundancy to **survive a memory tier going unresponsive mid-serve** without forcing a cold re-prefill for every active request.
+- `CpuTier` is a **symmetric abstraction** — nothing about "fast" vs "slow" leaks into the code paths that `placement_mode` will later flip. The only asymmetry (demotion direction) lives inside `FastTierBlockPool` and is easy to replace per mode.
+- Worker metadata already carries per-block source-tier hints (`load_cpu_tiers: list[int]` in the M1 design above). That field generalizes to "valid tiers in preference order" without a schema change.
+- `DmaCopyBackend.launch_copy` has no `timeout_ms` parameter today. Leaving the signature unchanged in M1 is fine; the resiliency proposal adds it as an optional kwarg.
 
-Concretely, a production deployment of hillock-vmem's secondary-memory tier may face:
-
-- **Transient stalls**: a CXL link flaps, a remote NUMA node wedges, an ioctl hangs, an out-of-band firmware event takes a tier unresponsive for seconds.
-- **Partial failures**: one pool's backing store is healthy but slow (thermal throttle, neighbor noise, flaky DMA path).
-- **Planned degradation**: one tier is rebooted or reconfigured while the serving process stays up.
-
-In all three cases the vLLM process is alive, other requests are still flowing, and dropping in-flight requests that happened to hit the sick pool is a poor outcome. A resilient design lets those requests transparently fall over to the surviving pool with at most a latency hit — no re-prefill, no request failure.
-
-### Placement modes (the design space)
-
-Resiliency is fundamentally a placement question: *do blocks live in one pool, the other, or both?* M1's **exclusive** mode is the non-resilient endpoint. Two more modes define the rest of the spectrum:
-
-| Mode | Semantics | Effective capacity | Resiliency | In M1? |
-|---|---|---|---|---|
-| **exclusive** | Block lives in fast OR slow, never both. Fast-to-slow demotion on fast eviction. | `fast + slow` | **None** — losing either pool loses whatever was only there | **Yes** (only mode) |
-| **hybrid** | New stores go to fast; a bounded async mirror also writes to slow. Under capacity pressure the mirror becomes the demotion (exclusive) path. | Between `min(fast,slow)` and `fast + slow` depending on pressure | Partial — recently-stored hot blocks are replicated, older demoted ones are not | No |
-| **replicate** | Every store goes to both pools. Loads prefer fast; slow is used on fast-miss or fast-failure. | `min(fast, slow)` | **Full** — either pool alone is sufficient to continue serving | No |
-
-These become **selectable at connector init** via a future `kv_connector_extra_config.placement_mode` field (default `"exclusive"`, preserving M1 behavior). Users pick where on the spectrum they sit based on workload (resiliency-critical serving vs. max-capacity batch).
-
-### Failure model and mechanisms (sketch)
-
-The resiliency modes target **hot failure**: a pool becomes unresponsive during live serving, not a process restart. That means recovery has to happen in-band, while other requests are flowing. Rough mechanism stack:
-
-1. **Detect**: per-pool read/write timeout on `DmaCopyBackend.launch_copy`. Per-pool health state (`healthy` / `suspect` / `quarantined`). Configurable timeout budget; exponential back-off on suspect pools.
-2. **Fail over**: on a read timeout in fast, retry on slow (requires the block to also be in slow — so only meaningful in `replicate` or lucky-case `hybrid`). On a write failure in slow under `replicate`, drop the mirror and degrade to exclusive placement for that block (log once).
-3. **Quarantine**: stop issuing new ops against a suspect pool after N consecutive failures. Manual re-enable in the first cut; auto-heal as a follow-follow-up.
-4. **Re-replicate**: when a quarantined pool recovers, background re-replicate from the survivor to restore redundancy. Rate-limited to avoid stepping on live serving.
-
-### What M1 must *not* foreclose
-
-To keep this proposal cheap to implement later, M1 must land in a shape that admits it without refactoring. Specifically:
-
-- `CpuTier` is a **symmetric abstraction** — nothing about "fast" vs "slow" leaks into the code paths that placement mode will later flip. The only asymmetry today (demotion direction) lives inside `FastTierBlockPool` and is easy to replace per mode.
-- Metadata already carries a **per-block source-tier hint** (`load_cpu_tiers: list[int]` in the M1 design above). That same field becomes the failover target when the hint pool is quarantined.
-- `DmaCopyBackend.launch_copy` has no timeout today. Leaving the signature unchanged in M1 is fine, but the follow-up will need to add one — calling it out here so reviewers of the M1 PRs are not surprised later.
+If M1 review uncovers anything that would constrain the resiliency design, we update both RFCs together.
 
 ## Verification
 
