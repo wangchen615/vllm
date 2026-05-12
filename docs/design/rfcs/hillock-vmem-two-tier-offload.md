@@ -14,12 +14,43 @@ The `hillock-vmem` project wants vLLM to offload GPU KV cache to **two CPU memor
 
 We chose to fork `SimpleCPUOffloadConnector` (author: Yifan Qiao, `vllm/v1/simple_kv_offload/`, ~1350 LOC). It has a clean dual-coordinator pattern (GPU + CPU `KVCacheCoordinator`) that extends naturally to a third coordinator, and its `DmaCopyBackend` has the pinned-memory / low-priority-stream plumbing we need.
 
-**M1 goal**: end-to-end GPU ↔ fast CPU ↔ slow CPU tiering working in **eager mode only**, with both pools physically backed by pinned host memory (same mechanism; latency asymmetry simulated in M2 or via NUMA placement later). Lazy mode, HMA hardening, and non-pinned/CXL backings are out of scope for M1.
+**M1 goal**: end-to-end GPU ↔ fast CPU ↔ slow CPU tiering working in **eager mode, exclusive placement only** (see placement modes below), with both pools physically backed by pinned host memory (same mechanism; latency asymmetry simulated in M2 or via NUMA placement later). Lazy mode, HMA hardening, resiliency (hybrid / replicate modes), and non-pinned/CXL backings are out of scope for M1 — a follow-up RFC will own those.
 
 The design we're committing to:
 - **Cascade**: Stores land in fast. When fast is full, the LRU victim is **demoted** to slow (CPU→CPU copy) to free a fast slot. When both are full, we drop the store silently (same as today's single-pool behavior at capacity).
 - **Load**: Check fast first; fall back to slow. On slow hit, **promote** to fast (copying via GPU is unnecessary — a CPU→CPU copy during/after the main load suffices; M1 keeps it simple: serve from slow directly, no promotion).
 - **Config**: Two explicit knobs in `kv_connector_extra_config`: `fast_cpu_bytes` and `slow_cpu_bytes`. Legacy `cpu_bytes_to_use` keeps working and maps to `fast_cpu_bytes` (slow defaults to 0 → single-pool behavior, fully backward compatible).
+
+## Why two pools (the full motivation)
+
+Two CPU memory pools — one faster, one larger — gives us three distinct wins, in roughly decreasing strength-of-evidence:
+
+1. **Capacity**: total offloadable KV grows to `fast + slow`. For long-context serving workloads where prefix reuse dominates, more cached prefix directly cuts re-prefill cost.
+2. **Prefix-miss latency**: a fast tier (pinned host RAM near the accelerator, ideally NVLink / CXL-close) serves prefix-miss reloads much faster than a slow tier (NUMA-far, CXL-far, or capacity-optimized memory), and the scheduler can route hot prefixes there. This is the primary win for TTFT on cache hits.
+3. **Resiliency**: with both pools active and carrying (some) copies of the same blocks, the system can survive **one pool becoming unresponsive mid-serve** — the surviving pool still has enough to continue serving without forcing a cold re-prefill for every active request.
+
+These three goals sit on a spectrum defined by **how blocks are placed across the two pools**. M1 picks one point on that spectrum; the RFC declares the whole space so the code lands in a shape that extends cleanly.
+
+### Placement modes (future design space)
+
+| Mode | Semantics | Effective capacity | Resiliency | In M1? |
+|---|---|---|---|---|
+| **exclusive** | Block lives in fast OR slow, never both. Fast-to-slow demotion on fast eviction. | `fast + slow` | **None** — losing either pool loses whatever was only there | **Yes** (only mode) |
+| **hybrid** | New stores go to fast; a bounded async mirror also writes to slow. Under capacity pressure the mirror becomes the demotion (exclusive) path. | Between `min(fast,slow)` and `fast + slow` depending on pressure | Partial — recently-stored hot blocks are replicated, older demoted ones are not | No (follow-up RFC) |
+| **replicate** | Every store goes to both pools. Loads prefer fast; slow is used on fast-miss or fast-failure. | `min(fast, slow)` | **Full** — either pool alone is sufficient to continue serving | No (follow-up RFC) |
+
+These are **selectable at connector init** — future `kv_connector_extra_config.placement_mode`. Users pick where on the spectrum they sit based on workload (resiliency-critical serving vs. max-capacity batch). Defaulting to `exclusive` preserves M1 behavior.
+
+### Failure model for resiliency (follow-up)
+
+The resiliency modes target **hot failure**: one pool's backing store becomes unresponsive during live serving (e.g., a CXL link flaps, a remote NUMA node wedges, a pool's ioctl hangs). In that regime a loss is not a restart signal — the process is still up, other requests are still flowing, and we need to:
+
+1. **Detect** the hang in-band (read timeout, error-return from the copy path).
+2. **Fail over** the in-flight transfer to the surviving pool without aborting the request.
+3. **Quarantine** the failed pool so we don't keep re-issuing against it.
+4. **Optionally re-replicate** surviving-only blocks to a replacement pool when one comes back.
+
+This is materially more complex than cold-restart recovery (which would only need "on startup, reload from whichever pool is alive"). The follow-up RFC will own detection thresholds, timeout budgets, and whether quarantine is manual or automatic.
 
 ## Key constraints discovered during exploration
 
@@ -92,11 +123,30 @@ The net effect: from the allocator's perspective `get_new_blocks` still returns 
 
 ## Out of scope for M1
 
+- **Placement modes other than `exclusive`** — `hybrid` and `replicate` are deferred to the follow-up RFC below. The config surface is shaped so adding a `placement_mode` knob later does not break existing configs.
+- **Resiliency (hot-failure detection & failover)** — single-pool failure means the blocks in that pool are lost; requests mid-serve against them will miss and re-prefill. Follow-up RFC.
 - Lazy mode tiering (keep lazy path single-pool or disabled when `slow_cpu_bytes>0`)
 - Promotion on slow-tier load hit
 - HMA multi-group interaction (slow pool shares groups with fast → should Just Work but untested)
 - Real slow-medium backings (NUMA-remote, unpinned, CXL, NVMe)
 - Metrics / observability — add only a log line per tier
+
+## Follow-up RFC: resiliency + placement modes
+
+This is a sketch, not a commitment — the next RFC owns the details. Capturing it here so the M1 code lands in a shape the follow-up can build on without re-plumbing.
+
+**Scope of the follow-up RFC:**
+- Add `placement_mode: "exclusive" | "hybrid" | "replicate"` to `kv_connector_extra_config`. Default `"exclusive"` preserves M1 behavior.
+- **Replicate mode**: store writes both tiers; loads read fast, fall back to slow on miss *or* failure. Effective capacity `min(fast, slow)`.
+- **Hybrid mode**: store writes fast eagerly, mirror-writes slow under a bounded queue. When fast is full, the mirror becomes the demotion (i.e., hybrid degrades to exclusive under pressure). Effective capacity between `min(fast, slow)` and `fast + slow`.
+- **Hot-failure detection**: read/write timeout on `DmaCopyBackend.launch_copy`; per-pool health state (`healthy` / `suspect` / `quarantined`). Configurable timeout budget; exponential back-off on suspect pools; manual-only re-enable in the first cut, auto-heal as a follow-follow-up.
+- **Failover semantics**: on a read timeout in fast, retry on slow; on a write failure in slow under `replicate`, drop the mirror and degrade to exclusive placement for that block (log once).
+- **Re-replication**: when a quarantined pool recovers, background re-replicate slow→fast (or vice versa) to restore redundancy. Bounded to avoid stepping on live serving.
+
+**What M1 must *not* foreclose** (design constraints passed from this RFC to the follow-up):
+- `CpuTier` must be a *symmetric* abstraction — nothing about "fast" vs "slow" should leak into the code paths that placement mode will later flip. The only asymmetry today (demotion direction) lives inside `FastTierBlockPool` and is easy to replace per mode.
+- Metadata carries a **per-block source-tier hint** already (`load_cpu_tiers: list[int]` in the RFC above). That same field becomes the failover target when the hint pool is quarantined.
+- `DmaCopyBackend.launch_copy` has no timeout today. Leaving the signature unchanged is fine for M1 but the follow-up will need to add one; we should mention this in the M1 worker change so reviewers aren't surprised later.
 
 ## Verification
 
