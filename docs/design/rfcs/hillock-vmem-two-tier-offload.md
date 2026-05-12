@@ -48,10 +48,17 @@ Scheduler holds `self._fast: CpuTier` and `self._slow: CpuTier | None`. Worker m
 
 **`_prepare_eager_store_specs` (`manager.py:446-582`)**:
 - Primary store target is fast. Same logic as today.
-- **New**: when fast has no free blocks (`num_free <= 0` at line 538), instead of breaking out, attempt **demotion**: pick LRU victim from fast (see below), enqueue a fast→slow CPU-to-CPU copy, free the fast slot, continue. Cap demotions per step to keep scheduler pass bounded — `max_demotions_per_step` = `target_free` blocks (same watermark idea as lazy mode).
-- Also skip blocks already present in **either** fast or slow (check both `cached_block_hash_to_block` maps).
+- Skip blocks already present in **either** fast or slow (check both `cached_block_hash_to_block` maps) to preserve the exclusive-placement invariant.
+- **Demotion is allocator-driven, not capacity-driven.** The current code's `num_free <= 0` check is *not* the right demotion trigger: `BlockPool.get_num_free_blocks()` returns `free_block_queue.num_free_blocks`, which already includes cached blocks with `ref_cnt == 0` (they stay on the free queue until popped). When `num_free == 0`, every block in the pool is actively pinned (`ref_cnt > 0`) and nothing is demotable. Demoting a pinned block would corrupt an in-flight transfer.
+- Correct trigger: **intercept the cached-block eviction inside the fast tier's allocator.** `BlockPool.get_new_blocks()` (block_pool.py:322) pops from `free_block_queue` and calls `_maybe_evict_cached_block()` (block_pool.py:354) whenever the popped block carries a `block_hash`. That call-site is exactly "I'm about to drop cached data on the floor" — we redirect it to "copy this cached data to slow, then drop from fast." The free queue is already LRU-ordered for cached blocks, so **no side LRU structure is needed**; `BlockPool` already picks the victim we want.
 
-**LRU tracking for demotion**: today's `BlockPool` doesn't expose an explicit LRU for *cached* (free-but-kept) blocks — the free queue intermixes them. Cheapest path: maintain a side `OrderedDict[block_hash, cpu_block_id]` in `CpuTier`, updated on every `_process_store_completion` (insert at MRU end) and on every cache hit during `update_state_after_alloc` (move to MRU end). To pick a demotion victim, pop from the LRU end and verify the block is still free (ref_cnt == 0); if not, skip and try next. Re-uses pattern from `vllm/v1/kv_offload/cpu/policies/lru.py` (Or Ozeri's code).
+**Fast-tier demotion hook**: rather than modify upstream `BlockPool`, we subclass it (`FastTierBlockPool` in `vllm/v1/simple_kv_offload/tier.py`) and override `_maybe_evict_cached_block`. On eviction of a cached block we:
+1. Look up the block's hash + payload,
+2. Allocate a slow-tier block for it (falling back to the base eviction behavior — i.e. truly drop — when slow has no capacity either),
+3. Enqueue a fast→slow CPU-to-CPU copy as a demote event in the next `build_connector_meta`,
+4. Let the original eviction complete (block becomes free and returns to the caller).
+
+The net effect: from the allocator's perspective `get_new_blocks` still returns as many blocks as requested; from the cache's perspective, hashes migrate fast→slow instead of disappearing. Cap queued demotions per step by the number of free slow blocks to keep `build_connector_meta` bounded.
 
 **Metadata (`vllm/v1/simple_kv_offload/metadata.py`)**: extend `SimpleCPUOffloadMetadata`:
 - `load_cpu_tiers: list[int]` parallel to `load_cpu_blocks`
@@ -60,7 +67,7 @@ Scheduler holds `self._fast: CpuTier` and `self._slow: CpuTier | None`. Worker m
 
 `build_connector_meta` emits up to 3 events per step (load, store-to-fast, demote-fast-to-slow). Keep existing per-event counter semantics.
 
-**Completion handling (`_process_store_event`, `_process_store_completion`)**: route completions to the correct tier. Add `_process_demote_event` that inserts hash into slow tier's cache map + removes from fast + free refs.
+**Completion handling (`_process_store_event`, `_process_store_completion`)**: route completions to the correct tier. Add `_process_demote_event` that inserts the block's hash into the slow tier's `cached_block_hash_to_block` map (the fast-side entry was already removed synchronously by `FastTierBlockPool._maybe_evict_cached_block` before the demote was enqueued, preserving the exclusive-placement invariant even while the host-to-host copy is in flight — readers that hit the hash post-eviction will find it in slow).
 
 ### Worker-side changes (`vllm/v1/simple_kv_offload/worker.py`)
 
@@ -75,12 +82,13 @@ Scheduler holds `self._fast: CpuTier` and `self._slow: CpuTier | None`. Worker m
 | File | Change |
 |---|---|
 | `vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py` | Parse `fast_cpu_bytes` / `slow_cpu_bytes` from `extra_config`; backward-compat alias `cpu_bytes_to_use` → `fast_cpu_bytes`. Log both capacities. |
-| `vllm/v1/simple_kv_offload/manager.py` | Introduce `CpuTier`; dual-coordinator construction; cross-tier load + demotion store logic; LRU side-map; new event types. |
+| `vllm/v1/simple_kv_offload/tier.py` **(new)** | `CpuTier` dataclass; `FastTierBlockPool(BlockPool)` subclass overriding `_maybe_evict_cached_block` to redirect cached-block evictions into fast→slow demote events. |
+| `vllm/v1/simple_kv_offload/manager.py` | Dual-coordinator construction (fast uses `FastTierBlockPool`); cross-tier load path; demote-event plumbing; `_process_demote_event`. |
 | `vllm/v1/simple_kv_offload/worker.py` | Dual pinned-tensor allocation; two `DmaCopyBackend` instances + demote backend; launch + poll three event streams. |
 | `vllm/v1/simple_kv_offload/metadata.py` | Extend metadata dataclasses with tier fields + demote event. |
 | `vllm/v1/simple_kv_offload/copy_backend.py` | No change expected — verify host→host with pinned-memory works via existing `cuMemcpyBatchAsync`; if not, add a thin `MemcpyKind.HostToHost` path. |
 
-**Not modified for M1**: `OffloadingConnector`, `MultiConnector`, `KVCacheCoordinator`, `BlockPool`. Zero-change upstream code.
+**Not modified for M1**: `OffloadingConnector`, `MultiConnector`, `KVCacheCoordinator`, upstream `BlockPool` (we only *subclass* it — no edits to `vllm/v1/core/block_pool.py`).
 
 ## Out of scope for M1
 
@@ -133,7 +141,7 @@ Expected: logs show `SimpleCPUOffloadConnector: fast=... slow=...` and `demote e
 ## Open questions deferred to during-implementation
 
 - Whether `cuMemcpyBatchAsync` accepts `HostToHost` with pinned memory today — if not, add a small path in `cuda_mem_ops.py`. Will verify in code, not blocking plan.
-- Whether the LRU side-map needs thread-safety — the scheduler runs single-threaded today but worth a re-check once the code is written.
+- Whether `FastTierBlockPool._maybe_evict_cached_block` can safely allocate a slow-tier block synchronously from inside the fast allocator's critical path, or whether we should record "evicted hash + payload pointer" and do the slow-pool allocation one layer up in the manager. First design is simpler; the second is safer if either pool ever holds a lock.
 
 ## Branch & PR plan
 
@@ -149,7 +157,7 @@ These map 1:1 to the task list tracked during planning. Each can become a GitHub
 - [ ] **[Metadata] Extend `SimpleCPUOffloadMetadata` with tier fields + demote event** — new dataclass fields; extend `aggregate()` on worker metadata.
 - [ ] **[Scheduler] Introduce `CpuTier` + dual coordinators** — refactor `SimpleCPUOffloadScheduler` to hold `_fast` and optional `_slow`; single-tier fallback when `slow_cpu_bytes=0`.
 - [ ] **[Scheduler] Cross-tier load path** — `get_num_new_matched_tokens` + `update_state_after_alloc` check both tiers; `TransferMeta.cpu_tiers` tracks source.
-- [ ] **[Scheduler] Demotion in eager store path** — LRU side-map per tier; demote fast→slow when fast is full; cap demotions per step.
+- [ ] **[Scheduler] Demotion via fast-tier allocator hook** — add `FastTierBlockPool` subclass overriding `_maybe_evict_cached_block`; redirect cached-block evictions into fast→slow demote events; cap queued demotions per step by free slow blocks.
 - [ ] **[Scheduler] Completion handling for 3 event types** — split `_process_store_event` into load/store/demote; hash-map migration on demote completion.
 - [ ] **[Worker] Dual pinned tensors + two `DmaCopyBackend` instances** — allocate per-tier CPU tensors; add `_demote_backend` for host→host.
 - [ ] **[Worker] Launch + poll 3 event streams** — dispatch to correct backend; report completed demote events.
