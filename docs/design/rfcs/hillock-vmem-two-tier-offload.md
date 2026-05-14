@@ -24,6 +24,28 @@ The `hillock-vmem` project aims for a **three-level memory hierarchy** for LLM K
 
 The middle tier — the **secondary fast memory system** — is the novel piece. It's **larger than HBM, smaller than host DRAM, and faster than host DRAM to reach from the accelerator** (think CXL-attached memory, near-accelerator vmem, NVLink-reachable DDR). When the GPU's KV cache is full, we'd rather spill hot blocks to the secondary fast memory system (cheap reload) than all the way to slow DRAM on the host (expensive reload). When the secondary fast memory system is full, we cascade to slow host DRAM.
 
+### Hierarchy semantics: speed *and* placement policy
+
+The hierarchy is not defined by speed alone. A second axis — the **placement policy** — decides whether a block lives in one tier, the other, or both. Speed alone gets you a fast lookup path; placement policy gets you capacity additivity vs. resiliency vs. read-only sharing semantics. The two axes are independent and equally first-class.
+
+vLLM's existing offload connectors implicitly fix this axis at "exclusive (single tier)" — there's only one CPU pool, so the question doesn't arise. With two tiers it does. Three modes cover the spectrum:
+
+| Mode | Semantics | Effective capacity | Resiliency | In M1? |
+|---|---|---|---|---|
+| **exclusive** | Block lives in fast OR slow, never both. Fast→slow demotion on fast eviction. | `fast + slow` | None — losing either tier loses whatever was only there | **Yes** (the only M1 mode) |
+| **hybrid** | New stores go to fast; a bounded async mirror also writes to slow. Under capacity pressure the mirror becomes the demotion (exclusive) path. | Between `min(fast, slow)` and `fast + slow` | Partial — recently-stored hot blocks are replicated, older demoted ones are not | No |
+| **replicate** | Every store goes to both tiers. Loads prefer fast; slow is used on fast-miss or fast-failure. | `min(fast, slow)` | Full — either tier alone is sufficient to continue serving | No |
+
+**M1 implements `exclusive` only.** The mode is selected via a future `kv_connector_extra_config.placement_mode` field; defaulting to `"exclusive"` preserves M1 behavior. The companion [resiliency RFC](hillock-vmem-resiliency.md) owns the design and use cases for `hybrid` and `replicate`.
+
+### Use cases driving the design
+
+These motivate why two tiers (and eventually all three placement modes) are worth the complexity. M1 only needs to enable the first; the others justify why M1's abstractions need to stay symmetric and not foreclose future modes.
+
+1. **KV-cache offload for long-context serving** — *driven by `exclusive` mode (M1)*. More cached prefix → fewer re-prefills. Two tiers grow the offload pool from `slow` alone to `fast + slow`, with hot prefixes biased toward the fast tier for cheaper reload.
+2. **Resilient serving across memory-tier failures** — *driven by `hybrid` and `replicate` modes (resiliency RFC)*. A real three-level hierarchy is naturally redundant; placement policy decides whether we exploit that to survive a tier going unresponsive mid-serve.
+3. **Model sharing for agentic workflows with rapid model switches** — *driven by `replicate` mode, with a read-only / externally-managed variant*. Multiple accelerators (e.g. several Spyre devices) each load the same model from a Hillock-backed memory pool. The model stays canonical in Hillock; each executor brings it in to run, but Hillock retains the master copy. This is `replicate` semantically, with two extensions: (a) the slow tier is **read-only** from the connector's perspective — only Hillock writes, executors only read; (b) the slow tier is **externally managed** — the connector doesn't control evictions, the platform does. Heavy model overcommit and rapid model switches in agentic workflows make this a load-bearing use case rather than a curiosity. Out of M1 scope, mentioned here so M1's abstractions don't silently exclude it (e.g., the `CpuTier` abstraction must not assume the connector owns the tier's lifecycle).
+
 ### Why this RFC uses two CPU pools
 
 We don't yet have the secondary fast memory system hardware available for vLLM testing. **M1 emulates the three-level hierarchy by using two separate CPU memory pools** as stand-ins for the secondary fast memory system and the slow DRAM on host. Both pools are just pinned host DRAM today, so there's no real latency asymmetry in M1 — the point of M1 is to prove that **vLLM's Simple KV-offload connector can be extended with small, well-scoped changes to manage two distinct address spaces** (allocation, eviction, exclusive placement, metadata, worker-side transfers, completion plumbing). Once that functional foundation is in place, swapping pool #0 to a real secondary fast memory backing (NUMA-local pinned, CXL, vmem, etc.) is a contained change in the worker — the scheduler logic doesn't have to move.
@@ -32,9 +54,9 @@ We considered vLLM's three existing offloading connectors before deciding to for
 
 ### M1 goal
 
-Demonstrate that `SimpleCPUOffloadConnector` can manage **two CPU pools as two distinct address spaces**, in **eager mode with exclusive placement only**. In the terminology above: pool #0 is the emulated **secondary fast memory system** (referred to in the code as "fast"), pool #1 is the emulated **slow DRAM on host** (referred to in the code as "slow"). Both are pinned DRAM; asymmetric performance is deliberately out of scope — M1 measures *functional correctness* (blocks placed and migrated correctly, exclusive placement preserved, metadata + completion wiring works end-to-end), not throughput.
+Demonstrate that `SimpleCPUOffloadConnector` can manage **two CPU pools as two distinct address spaces**, in **eager mode with `exclusive` placement only** (see modes table above). In the terminology above: pool #0 is the emulated **secondary fast memory system** (referred to in the code as "fast"), pool #1 is the emulated **slow DRAM on host** (referred to in the code as "slow"). Both are pinned DRAM; asymmetric performance is deliberately out of scope — M1 measures *functional correctness* (blocks placed and migrated correctly, exclusive placement preserved, metadata + completion wiring works end-to-end), not throughput.
 
-What's explicitly not being claimed for M1: capacity additivity, prefix-miss speedup, or resiliency wins. Those follow from a real secondary fast memory backing (and, for resiliency, from a different placement mode) — see "Relationship to the resiliency proposal" below.
+What's explicitly not being claimed for M1: capacity additivity, prefix-miss speedup, resiliency, or model sharing. Those follow from a real secondary fast memory backing and/or from `hybrid` / `replicate` placement modes — covered in the [resiliency RFC](hillock-vmem-resiliency.md).
 
 ### Design committed for M1
 
@@ -114,8 +136,9 @@ The net effect: from the allocator's perspective `get_new_blocks` still returns 
 ## Out of scope for M1
 
 - **Asymmetric performance between the two pools** — M1 is a functional emulation; both pools are pinned DRAM. Real secondary fast memory backings (NUMA-local, CXL-attached, near-accelerator vmem, NVMe, etc.) are follow-up work.
-- **Placement modes other than `exclusive`** — `hybrid` and `replicate` motivate the resiliency proposal below. The config surface is shaped so adding a `placement_mode` knob later does not break existing configs.
-- **Resiliency (hot-failure detection & failover)** — see proposal below; M1 does not implement any of it.
+- **Placement modes other than `exclusive`** — `hybrid` (partial replication) and `replicate` (full replication) are described in the [resiliency RFC](hillock-vmem-resiliency.md). M1's config surface is shaped so adding a `placement_mode` knob later does not break existing configs.
+- **Resiliency (hot-failure detection & failover)** — see [resiliency RFC](hillock-vmem-resiliency.md); M1 implements none of it.
+- **Model sharing with read-only / externally-managed tiers** — the variant of `replicate` mode covering use case 3 above. Not in M1; M1's `CpuTier` abstraction is shaped to accommodate it (no assumption that the connector owns tier lifecycle), but neither implementation nor full design is in scope here.
 - Lazy mode tiering (keep lazy path single-pool or disabled when `slow_cpu_bytes>0`)
 - Promotion on slow-tier load hit
 - HMA multi-group interaction (slow pool shares groups with fast → should Just Work but untested)
@@ -123,13 +146,14 @@ The net effect: from the allocator's perspective `get_new_blocks` still returns 
 
 ## Relationship to the resiliency proposal
 
-A companion RFC, [hillock-vmem-resiliency.md](hillock-vmem-resiliency.md), proposes how to exploit the hierarchy's natural redundancy to survive a memory-tier failure mid-serve. That proposal has its own motivation, placement modes (`exclusive` / `hybrid` / `replicate`), failure model (hot failure), and mechanism stack (detect / failover / quarantine / re-replicate). It is **not** scheduled for M1.
+A companion RFC, [hillock-vmem-resiliency.md](hillock-vmem-resiliency.md), owns the design for `hybrid` and `replicate` modes plus the failure-detection / failover / re-replication mechanisms. It is **not** scheduled for M1.
 
 What M1 must *not* foreclose so the resiliency proposal remains cheap to land later:
 
 - `CpuTier` is a **symmetric abstraction** — nothing about "fast" vs "slow" leaks into the code paths that `placement_mode` will later flip. The only asymmetry (demotion direction) lives inside `FastTierBlockPool` and is easy to replace per mode.
 - Worker metadata already carries per-block source-tier hints (`load_cpu_tiers: list[int]` in the M1 design above). That field generalizes to "valid tiers in preference order" without a schema change.
 - `DmaCopyBackend.launch_copy` has no `timeout_ms` parameter today. Leaving the signature unchanged in M1 is fine; the resiliency proposal adds it as an optional kwarg.
+- `CpuTier` does **not** assume the connector owns the tier's lifecycle. M1 does happen to allocate and free both pools internally, but the abstraction must allow a future tier where allocation, write, and eviction are owned by an external manager (the model-sharing / read-only variant of `replicate`). Concretely: a tier's "store" path must be conditional on a writability flag, and the connector's eviction logic must tolerate a tier where blocks appear and disappear independently of connector actions.
 
 If M1 review uncovers anything that would constrain the resiliency design, we update both RFCs together.
 
