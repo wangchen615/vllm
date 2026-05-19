@@ -69,18 +69,20 @@ For both use cases, the relevant property — tier health (use case 1) or tier w
 
 ### Placement modes (the core design space)
 
-Resiliency is fundamentally a **placement** question: *do blocks live in one tier, the other, or both?* M1's `exclusive` mode is the non-resilient endpoint. Two more modes fill out the spectrum:
+Resiliency is fundamentally a **placement** question: *do blocks live in one tier, the other, or both?* M1's `partitioned` mode is the non-resilient endpoint. Two more modes fill out the spectrum:
 
 | Mode | Semantics | Effective capacity | Resiliency | In M1? |
 |---|---|---|---|---|
-| **exclusive** | Block lives in fast OR slow, never both. Fast-to-slow demotion on fast eviction. | `fast + slow` | **None** — losing either tier loses whatever was only there | **Yes** (the only M1 mode) |
-| **hybrid** | New stores go to fast; a bounded async mirror also writes to slow. Under capacity pressure the mirror becomes the demotion (exclusive) path. | Between `min(fast, slow)` and `fast + slow` depending on pressure | Partial — recently-stored hot blocks are replicated, older demoted ones are not | No |
+| **partitioned** | Each request is admitted to one tier based on a per-request signal (priority). The two tiers cache different sets of blocks. No inter-tier movement. | `fast + slow` (but each tier holds different blocks) | **None** — losing either tier loses whatever was admitted there | **Yes** (the only M1 mode) |
+| **hybrid** | New stores go to fast; a bounded async mirror also writes to slow. Under capacity pressure the mirror is dropped (degrades to `partitioned`-like single-tier residence). | Between `min(fast, slow)` and `fast + slow` depending on pressure | Partial — recently-stored hot blocks are replicated, older ones may not be | No |
 | **replicate** | Every store goes to both tiers. Loads prefer fast; slow is used on fast-miss or fast-failure. | `min(fast, slow)` | **Full** — either tier alone is sufficient to continue serving | No |
 
-The mode is selected at connector init via a new `kv_connector_extra_config.placement_mode` field (default `"exclusive"`, preserving M1 behavior). Users pick where on the spectrum they sit based on workload:
+> **Cascade is deliberately *not* one of these modes.** Cascade (write-fast, demote-on-eviction) is what `OffloadingConnector` and `SimpleCPUOffloadConnector` already do. hillock-vmem's novelty is `partitioned` (M1) and `replicate` / `hybrid` (this RFC); cascade adds nothing new and doesn't compose well with the others (mixing demotion with replication produces ambiguous "where does this block live?" questions). If a deployment wants cascade, the existing connectors serve it.
 
-- Max-capacity batch inference → `exclusive`
-- Production serving with SLO guarantees → `replicate` (pay the capacity tax for survival)
+The mode is selected at connector init via a new `kv_connector_extra_config.placement_mode` field (default `"partitioned"`, preserving M1 behavior). Users pick where on the spectrum they sit based on workload:
+
+- Class-of-service serving (priority-routed traffic, capacity-oriented) → `partitioned`
+- Production serving with SLO guarantees on memory-tier failures → `replicate`
 - Mixed production with some SLO headroom → `hybrid`
 - Agentic / multi-model workloads with rapid model switches → `replicate` with the read-only / externally-managed variant (see "Model-sharing variant" below)
 
@@ -120,9 +122,10 @@ Cold-restart recovery (reload KV from the survivor on process boot) is a strictl
    - `suspect → healthy`: M consecutive successes within window W.
 
 2. **Fail over (inline on read path)**
-   - On a fast-tier read timeout, retry the read on slow if the block is known to be there (i.e., `placement_mode` ∈ {`hybrid`, `replicate`} *and* the per-block source-tier hint indicates slow also holds a copy).
-   - If the block is not replicated (`exclusive` mode, or `hybrid` with a demoted-only block), the request falls back to re-prefill — same outcome as today's single-pool failure.
-   - On a slow-tier write failure under `replicate`, drop the mirror for that block and degrade it to `exclusive` placement (log once). Store to fast still succeeds.
+   - **Failover model: synchronous, single-retry, bounded.** On a fast-tier read timeout, the worker issues *one* retry on the slow tier from the same `get_finished` call. No speculative parallel issue (would double bandwidth on the healthy tier under failure storms); no async fallback (would require deferring the request, complicating scheduler interaction). The retry's deadline is `tier_timeout_ms` — total worst-case load latency is `2 × tier_timeout_ms` per failover.
+   - **Retry budget is per-step, not per-block.** If multiple blocks for the same load event each timeout on fast, all retry on slow within the same step. A step that exceeds `step_timeout_budget_ms` (config, default `5 × tier_timeout_ms`) gives up and signals re-prefill rather than continuing to retry — bounds tail latency under correlated failures.
+   - **Eligibility**: retry only if the block is known to be in slow (i.e., `placement_mode` ∈ {`hybrid`, `replicate`} *and* the block's `replica_tiers` includes slow). Otherwise the request falls back to re-prefill — same outcome as today's single-pool failure under `partitioned`.
+   - On a slow-tier write failure under `replicate`, drop the mirror for that block and degrade it to single-tier residence (log once). Store to fast still succeeds.
 
 3. **Quarantine**
    - Once quarantined, a tier is skipped by all new ops. Existing pinned blocks in that tier stay pinned (they might become reachable again), but the allocator no longer considers it.
@@ -138,8 +141,9 @@ New fields in `kv_connector_extra_config`:
 
 | Field | Type | Default | Effect |
 |---|---|---|---|
-| `placement_mode` | `"exclusive" \| "hybrid" \| "replicate"` | `"exclusive"` | Picks the replication policy. |
+| `placement_mode` | `"partitioned" \| "hybrid" \| "replicate"` | `"partitioned"` | Picks the placement policy. |
 | `tier_timeout_ms` | int | `0` (disabled) | Per-op timeout on `DmaCopyBackend.launch_copy`. `0` = no timeout (M1 behavior). |
+| `step_timeout_budget_ms` | int | `5 * tier_timeout_ms` | Total time a single scheduler step will spend on tier ops including retries. Once exceeded, remaining timed-out blocks signal re-prefill rather than retrying. |
 | `tier_failure_threshold` | int | `3` | Consecutive failures to move `suspect → quarantined`. |
 | `tier_recovery_threshold` | int | `10` | Consecutive successes to move `suspect → healthy`. |
 | `replication_rate_limit_mb_s` | int | `256` | Cap on background re-replication bandwidth. |
@@ -152,38 +156,52 @@ Backward compat: omitting all of these reproduces M1 behavior exactly.
 
 The M1 RFC already carries per-block source-tier hints (`load_cpu_tiers: list[int]` in the worker metadata). This proposal reuses them:
 
-- **`load_cpu_tiers`** becomes the list of **valid source tiers** for a block (not just one primary). Worker picks in order of preference; on timeout it advances to the next.
-- New per-block field: `replica_tiers: set[int]` — the tiers the block is known to exist in (for `replicate` / `hybrid`). Populated on store completion, consulted on read for failover eligibility.
+- **`load_cpu_tiers`** becomes the list of **valid source tiers** for a block in preference order. Worker picks the first; on timeout it advances to the next.
+- **New per-block field: `replica_tiers: set[int]`** — the tiers the block is known to exist in (for `replicate` / `hybrid`). Used by the failover read path to decide retry eligibility.
 
-No change to the block-hash encoding: exclusive placement is still the invariant within a single mode's perspective, but replicated modes track "which tiers hold this hash" as metadata sidecar, not as duplicate entries in `cached_block_hash_to_block`.
+**`replica_tiers` is advisory, not authoritative.** The scheduler updates it on store-completion (insert) and quarantine (remove the quarantined tier), but it is *not* a global lock — the worker may briefly see a block listed in `replica_tiers` that has just been evicted from one of those tiers, and vice versa. The invariant we maintain is one-way: **if `replica_tiers` does *not* list tier T, the block is definitely not in T.** The opposite ("listed → present") is best-effort. Code that consumes `replica_tiers` must handle "miss in the supposed tier" as a normal outcome:
+- **Failover**: if retry on slow misses, signal re-prefill (same as if `replica_tiers` had said "slow not present" to begin with).
+- **Re-replication**: if re-replication source-read misses, skip that block and move on.
+
+This advisory contract avoids cross-step locking and matches how `BlockPool.cached_block_hash_to_block` already behaves under concurrent eviction.
+
+**Externally-managed tier consistency.** For tiers with `externally_managed=true` (the model-sharing variant), the connector cannot trust `replica_tiers` even as advisory — the platform may swap *different* data in under the same address without notifying us. We need a stronger invariant.
+
+- **Mechanism (proposed)**: each block stored to or read from an externally-managed tier carries a **platform-provided version token** in `cached_block_hash_to_block`'s value (alongside the block ID). The token is opaque to the connector — it could be a generation counter, an epoch, or a cryptographic hash, depending on what the platform exposes.
+- **Read path**: lookup gives `(block_id, expected_version)`. Worker reads the block *and* the tier's current version for that ID. Mismatch → treat as miss, evict the entry from `cached_block_hash_to_block`, signal re-prefill.
+- **Why not content hash on read?** Possible, but expensive (requires a full block hash on the hot path). Reserved as a fallback if the platform can't expose a version token.
+
+The platform contract for the model-sharing variant must therefore include a `get_version(block_id) -> opaque_token` API, even if the implementation is just a per-block monotonic counter. Locked in here so the implementation work doesn't discover this gap mid-PR.
+
+No change to the block-hash encoding: each *physical* block still lives in exactly the tiers listed by `replica_tiers`, but replicated modes treat that set as advisory and verify on read where consistency requires it.
 
 ## Implementation sketch
 
 Not scoped here, but to show the work is contained:
 
 1. **Add `placement_mode` plumbing** through `SimpleCPUOffloadConnector.__init__` to `SimpleCPUOffloadScheduler` and `SimpleCPUOffloadWorker`.
-2. **Replace `FastTierBlockPool`'s single demotion path** with a mode-dispatch: `exclusive` keeps today's demote-on-evict; `hybrid` adds an async mirror on store; `replicate` stores to both unconditionally.
+2. **Replace M1's `_choose_tier(request)` admission helper** with a mode-aware store dispatcher. `partitioned` keeps M1's "store to one tier"; `hybrid` adds an async mirror on store; `replicate` stores to both synchronously. The change is local to a single method on the manager — eviction, load lookup, and metadata stay the same.
 3. **Add `TierHealth` state** to `CpuTier` — a small state machine with counters, drained on each `build_connector_meta`.
 4. **Wire `timeout_ms` through `DmaCopyBackend.launch_copy`** and expose a failure callback to the worker, which feeds the `TierHealth` state machine.
 5. **Add the failover read path** in `SimpleCPUOffloadWorker.get_finished`: on timeout, check `replica_tiers`, resubmit on a surviving tier.
 6. **Add a bounded re-replication scheduler** — a new low-priority event type, rate-limited by `replication_rate_limit_mb_s`.
-7. **Add per-tier `writable` and `externally_managed` flags** for the model-sharing variant. Skip stores against `writable=false` tiers. Add a freshness recheck on the load path for `externally_managed=true` tiers (compare the cached block hash against the tier's current view; treat a mismatch as a miss and remove the stale entry).
+7. **Add per-tier `writable` and `externally_managed` flags** for the model-sharing variant. Skip stores against `writable=false` tiers. Add a freshness recheck on the load path for `externally_managed=true` tiers (see "Externally-managed tier consistency" below for the chosen mechanism).
 
 ## Risks and open questions
 
-- **Timeout tuning is hard**: too tight and healthy-but-slow tiers get quarantined under load; too loose and failures aren't detected fast enough to matter. First cut should be conservative + configurable, with telemetry to tune in production.
+- **Timeout tuning is hard**: too tight and healthy-but-slow tiers get quarantined under load; too loose and failures aren't detected fast enough to matter. First cut should be conservative + configurable, with telemetry to tune in production. `step_timeout_budget_ms` defaulting to `5 × tier_timeout_ms` is a guess — needs validation against real workloads.
 - **Silent corruption is not covered**: this proposal defends against unresponsiveness, not wrong data. Checksumming per block is a materially larger project and probably a separate RFC.
-- **Split-brain during re-replication**: if a tier is quarantined, serves reads anyway, then returns and has stale data — we need to version blocks or treat every recovery as "wipe + re-replicate from survivor." The simpler option is the latter; worth confirming before implementation.
-- **Auto-heal vs manual re-enable**: automatic recovery detection risks flapping. Manual re-enable is safer but operationally worse. Decision can be deferred to implementation time.
-- **Cold-restart recovery**: arguably should be done **first** since it's simpler and provides most of the value for planned maintenance. TBD whether to split this proposal into "resiliency-cold" and "resiliency-hot" mini-RFCs.
-- **Externally-managed tier freshness**: the model-sharing variant assumes the connector can detect when a block referenced by `cached_block_hash_to_block` has been evicted by the external manager. The simplest mechanism is to recheck the tier's cache map on load; harder cases (the manager swaps in *different* data under the same address) require either an opaque versioning token from the platform or a content hash check on read. Pick one before implementation.
-- **Coordinating evictions across executors sharing a tier**: when N accelerators read from the same shared model tier, can any of them indirectly cause an eviction of a block another is depending on? In the model-sharing variant the platform manages eviction, so the answer depends on what the platform does — but the connector's load-time freshness recheck must be cheap enough that it's safe to run on the hot path.
+- **Split-brain during re-replication**: if a tier is quarantined, serves reads anyway, then returns and has stale data — we need to version blocks or treat every recovery as "wipe + re-replicate from survivor." Decision: **wipe + re-replicate from survivor** on recovery in M2; revisit if perf shows it's the bottleneck. Versioning is the model-sharing variant's job (see "Metadata changes" above), and that mechanism should be reused if hot-failure recovery ever needs versioning too.
+- **Auto-heal vs manual re-enable**: automatic recovery detection risks flapping. **Decision: manual re-enable in the first cut**, exposed via an admin RPC. Auto-heal is a follow-follow-up — needs a probe-while-quarantined mechanism that doesn't block live serving.
+- **Cold-restart recovery**: arguably should be done **first** since it's simpler and provides most of the value for planned maintenance. **Open question: split this proposal into "resiliency-cold" and "resiliency-hot" mini-RFCs?** Cold uses the same `placement_mode` config and `replica_tiers` metadata; only the detection / failover machinery differs. Splitting would let cold-restart land sooner with a smaller blast radius.
+- **Coordinating evictions across executors sharing a tier**: when N accelerators read from the same shared model tier, can any of them indirectly cause an eviction of a block another is depending on? In the model-sharing variant the platform manages eviction, so the answer depends on what the platform does. The connector's version-token check on load handles this safely (mismatch → re-prefill), but the cost depends on how cheap `get_version` is. **Open**: needs a number from the platform team before commitment.
+- **Scheduler interaction with retries**: the synchronous-retry model adds up to `2 × tier_timeout_ms` latency to a load on failover, which the scheduler doesn't know about. In a scheduling step, this can shift the latency profile of one step but does not change the scheduler's correctness — the step still completes. **Open**: whether to surface tier-failover events as a metric the scheduler can consume (for adaptive batching) or keep them invisible (simpler). M2 default: invisible; metric for telemetry only.
 
 ## Relationship to M1
 
 M1 lands no resiliency code and no model-sharing code. What M1 **must not foreclose** — already honored in the M1 RFC's design:
 
-- `CpuTier` is a **symmetric abstraction** — no "fast"-vs-"slow" asymmetry leaks into the code paths that `placement_mode` will later flip. The only asymmetry (demotion direction) lives inside `FastTierBlockPool`, which is easy to replace per mode.
+- `CpuTier` is a **symmetric abstraction** — no "fast"-vs-"slow" asymmetry leaks into the code paths that `placement_mode` will later flip. The only asymmetry (admission decision) lives in `SimpleCPUOffloadScheduler._choose_tier(request)`, easy to swap per mode.
 - Worker metadata already carries per-block source-tier hints (`load_cpu_tiers`). That field generalizes to "valid tiers in preference order" without a schema change.
 - `DmaCopyBackend.launch_copy` has no `timeout_ms` yet. M1 leaves the signature alone; this proposal adds the parameter as an optional kwarg.
 - `CpuTier` does **not** assume the connector owns the tier's lifecycle (write path conditional on a writability flag; eviction logic tolerant of externally-managed tiers). Required by the model-sharing variant of `replicate`.

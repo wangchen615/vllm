@@ -22,27 +22,31 @@ The `hillock-vmem` project aims for a **three-level memory hierarchy** for LLM K
                    from the accelerator)
 ```
 
-The middle tier — the **secondary fast memory system** — is the novel piece. It's **larger than HBM, smaller than host DRAM, and faster than host DRAM to reach from the accelerator** (think CXL-attached memory, near-accelerator vmem, NVLink-reachable DDR). When the GPU's KV cache is full, we'd rather spill hot blocks to the secondary fast memory system (cheap reload) than all the way to slow DRAM on the host (expensive reload). When the secondary fast memory system is full, we cascade to slow host DRAM.
+The middle tier — the **secondary fast memory system** — is the novel piece. It's **larger than HBM, smaller than host DRAM, and faster than host DRAM to reach from the accelerator** (think CXL-attached memory, near-accelerator vmem, NVLink-reachable DDR). It gives the system a place to keep hot KV blocks that don't fit in HBM but would be expensive to reload from host DRAM.
 
 ### Hierarchy semantics: speed *and* placement policy
 
-The hierarchy is not defined by speed alone. A second axis — the **placement policy** — decides whether a block lives in one tier, the other, or both. Speed alone gets you a fast lookup path; placement policy gets you capacity additivity vs. resiliency vs. read-only sharing semantics. The two axes are independent and equally first-class.
+The hierarchy is not defined by speed alone. A second axis — the **placement policy** — decides which tier holds which blocks, and whether the same block can live in more than one tier. Speed alone gets you a fast lookup path; placement policy decides what each tier is *for*. The two axes are independent and equally first-class.
 
-vLLM's existing offload connectors implicitly fix this axis at "exclusive (single tier)" — there's only one CPU pool, so the question doesn't arise. With two tiers it does. Three modes cover the spectrum:
+vLLM's existing offload connectors all implement one specific placement policy: **inclusive cascade** (write to fast, demote to slow on eviction, slow always backs up fast's overflow). hillock-vmem deliberately does *not* do this. The contrast is the project's main novelty:
 
-| Mode | Semantics | Effective capacity | Resiliency | In M1? |
+| Mode | Semantics | Block can live in… | Inter-tier movement | In M1? |
 |---|---|---|---|---|
-| **exclusive** | Block lives in fast OR slow, never both. Fast→slow demotion on fast eviction. | `fast + slow` | None — losing either tier loses whatever was only there | **Yes** (the only M1 mode) |
-| **hybrid** | New stores go to fast; a bounded async mirror also writes to slow. Under capacity pressure the mirror becomes the demotion (exclusive) path. | Between `min(fast, slow)` and `fast + slow` | Partial — recently-stored hot blocks are replicated, older demoted ones are not | No |
-| **replicate** | Every store goes to both tiers. Loads prefer fast; slow is used on fast-miss or fast-failure. | `min(fast, slow)` | Full — either tier alone is sufficient to continue serving | No |
+| **partitioned** | Each request is admitted to a tier based on a per-request signal (e.g. priority). The two tiers cache **different sets** of blocks. Each *physical* block lives in exactly one tier. | Exactly one tier | None — never copied between tiers | **Yes** (M1 mode) |
+| **hybrid** | New stores go to fast; a bounded async mirror also writes to slow. | One or both | Async mirror on store | No (resiliency RFC) |
+| **replicate** | Every store goes to both tiers. Loads prefer fast; slow is used on fast-miss or fast-failure. | Both | Sync on store | No (resiliency RFC) |
 
-**M1 implements `exclusive` only.** The mode is selected via a future `kv_connector_extra_config.placement_mode` field; defaulting to `"exclusive"` preserves M1 behavior. The companion [resiliency RFC](hillock-vmem-resiliency.md) owns the design and use cases for `hybrid` and `replicate`.
+> **What we are *not* doing**: the inclusive-cascade model that `OffloadingConnector` and `SimpleCPUOffloadConnector` already implement (write to fast, demote LRU victims to slow on fast eviction). Cascade is well-served by the existing connectors and adds no novelty here. M1 explicitly avoids it.
+
+**M1 implements `partitioned` only.** Admission is keyed on `Request.priority` (vLLM already plumbs this through `LLMEngine.add_request` and `AsyncLLM.add_request` — no API change needed). A configurable threshold `priority_threshold` decides which tier a request's blocks land in. Each tier evicts independently using its own `BlockPool`'s LRU; **no fast→slow demotion path exists**.
+
+The companion [resiliency RFC](hillock-vmem-resiliency.md) owns the design for `hybrid` and `replicate`.
 
 ### Use cases driving the design
 
-These motivate why two tiers (and eventually all three placement modes) are worth the complexity. M1 only needs to enable the first; the others justify why M1's abstractions need to stay symmetric and not foreclose future modes.
+These motivate why two *partitioned* tiers (and eventually `hybrid` / `replicate`) are worth the complexity. M1 only needs to enable the first; the others justify why M1's abstractions need to stay symmetric and not foreclose future modes.
 
-1. **KV-cache offload for long-context serving** — *driven by `exclusive` mode (M1)*. More cached prefix → fewer re-prefills. Two tiers grow the offload pool from `slow` alone to `fast + slow`, with hot prefixes biased toward the fast tier for cheaper reload.
+1. **Class-of-service KV cache for mixed-priority serving** — *driven by `partitioned` mode (M1)*. A serving system handles both latency-sensitive interactive requests and best-effort batch / agentic-background traffic on the same engine. With one undifferentiated CPU pool, low-priority KV evicts (or prevents caching of) high-priority KV. Partitioning by priority gives high-priority requests a smaller, tightly-managed fast tier insulated from low-priority churn, while low-priority requests still benefit from a larger slow-tier cache. **The two tiers cache different sets of KV blocks on purpose** — they're not a fast→slow cascade for the same data.
 2. **Resilient serving across memory-tier failures** — *driven by `hybrid` and `replicate` modes (resiliency RFC)*. A real three-level hierarchy is naturally redundant; placement policy decides whether we exploit that to survive a tier going unresponsive mid-serve.
 3. **Model sharing for agentic workflows with rapid model switches** — *driven by `replicate` mode, with a read-only / externally-managed variant*. Multiple accelerators (e.g. several Spyre devices) each load the same model from a Hillock-backed memory pool. The model stays canonical in Hillock; each executor brings it in to run, but Hillock retains the master copy. This is `replicate` semantically, with two extensions: (a) the slow tier is **read-only** from the connector's perspective — only Hillock writes, executors only read; (b) the slow tier is **externally managed** — the connector doesn't control evictions, the platform does. Heavy model overcommit and rapid model switches in agentic workflows make this a load-bearing use case rather than a curiosity. Out of M1 scope, mentioned here so M1's abstractions don't silently exclude it (e.g., the `CpuTier` abstraction must not assume the connector owns the tier's lifecycle).
 
@@ -54,95 +58,100 @@ We considered vLLM's three existing offloading connectors before deciding to for
 
 ### M1 goal
 
-Demonstrate that `SimpleCPUOffloadConnector` can manage **two CPU pools as two distinct address spaces**, in **eager mode with `exclusive` placement only** (see modes table above). In the terminology above: pool #0 is the emulated **secondary fast memory system** (referred to in the code as "fast"), pool #1 is the emulated **slow DRAM on host** (referred to in the code as "slow"). Both are pinned DRAM; asymmetric performance is deliberately out of scope — M1 measures *functional correctness* (blocks placed and migrated correctly, exclusive placement preserved, metadata + completion wiring works end-to-end), not throughput.
+Demonstrate that `SimpleCPUOffloadConnector` can manage **two CPU pools as two distinct address spaces** under a `partitioned` placement policy keyed on `Request.priority`. Pool #0 is the emulated **secondary fast memory system** (code: "fast"), pool #1 is the emulated **slow DRAM on host** (code: "slow"). Both are pinned DRAM; asymmetric performance is deliberately out of scope — M1 measures *functional correctness* (blocks routed to the correct tier by priority, each tier evicts independently, no inter-tier copies, metadata + completion wiring works end-to-end), not throughput.
 
-What's explicitly not being claimed for M1: capacity additivity, prefix-miss speedup, resiliency, or model sharing. Those follow from a real secondary fast memory backing and/or from `hybrid` / `replicate` placement modes — covered in the [resiliency RFC](hillock-vmem-resiliency.md).
+What's explicitly not being claimed for M1: capacity additivity (the tiers cache different sets of blocks, so capacity isn't simply additive across requests), prefix-miss speedup, resiliency, or model sharing. Those follow from a real secondary fast memory backing and/or from `hybrid` / `replicate` placement modes — covered in the [resiliency RFC](hillock-vmem-resiliency.md).
 
 ### Design committed for M1
 
-- **Cascade**: Stores land in fast (emulated secondary fast memory system). When fast is full, the LRU victim is **demoted** to slow (emulated slow DRAM on host) via a CPU→CPU copy. When both are full, we drop the store silently (same as today's single-pool behavior at capacity).
-- **Load**: Check fast first; fall back to slow. On slow hit, M1 serves from slow directly without promotion (promotion is a follow-up).
-- **Config**: Two explicit knobs in `kv_connector_extra_config`: `fast_cpu_bytes` and `slow_cpu_bytes`. Legacy `cpu_bytes_to_use` keeps working and maps to `fast_cpu_bytes` (slow defaults to 0 → single-pool behavior, fully backward compatible).
+- **Admission (the only routing decision)**: when a block becomes a store candidate, the scheduler reads `request.priority` (already an `int` field on `Request`, plumbed from `LLMEngine.add_request` and `AsyncLLM.add_request` without any upstream API change). If `priority < priority_threshold` the block is routed to the fast tier; otherwise to the slow tier. The decision happens once per block at admission time and **never changes** for the lifetime of that block. (vLLM convention: lower-int = higher-priority. So with `priority_threshold = 1`, requests submitted with `priority=0` — i.e. the default-priority interactive traffic — land in fast, while requests submitted with `priority>=1` — explicitly de-prioritized batch / agentic traffic — land in slow.)
+- **Eviction**: each tier is a vanilla `BlockPool` with its own LRU. When a tier is full and the next admission needs a slot, that tier evicts its own LRU victim — the block is *dropped*, not copied to the other tier. Both tiers operate independently.
+- **No demotion, no promotion, no inter-tier copies.** A block lives in exactly the tier its request was admitted to, until it's evicted from that tier or the request finishes.
+- **Load (cache-hit path)**: the prefix-cache lookup checks both tiers and serves from whichever holds the hit. If both have hits for different prefix ranges, we use the longer one. There's no implicit cross-tier copy on hit (no promotion).
+- **Config**: three explicit knobs in `kv_connector_extra_config`:
+  - `fast_cpu_bytes` — capacity of the fast (emulated secondary) tier. Default `0` (disabled → behave like single-pool slow-only).
+  - `slow_cpu_bytes` — capacity of the slow (emulated host DRAM) tier.
+  - `priority_threshold` — int. With `fast_cpu_bytes > 0`, defaults to `1` (default-priority requests → fast; explicitly de-prioritized requests → slow). Operators can raise it to admit more priority classes into fast or lower it (to `0` or below) to disable fast even when `fast_cpu_bytes > 0`.
+  - Legacy `cpu_bytes_to_use` keeps working: it maps to `slow_cpu_bytes` with `fast_cpu_bytes=0`, which routes everything to slow. Existing deployments see no behavior change.
 
 ## Key constraints discovered during exploration
 
-1. **Block-hash collisions**: `BlockPool.cached_block_hash_to_block` is instance-scoped (`vllm/v1/core/block_pool.py:171`) and keys embed group_id (`vllm/v1/core/kv_cache_utils.py:53-72`) — but **not** a tier identifier. If the same hash lands in both pools' maps, the lookup semantics at the scheduler (`_prepare_eager_store_specs` at `vllm/v1/simple_kv_offload/manager.py:528-534`) become ambiguous. Our cascade enforces **exclusive placement** (a block is in fast OR slow, never both), which sidesteps this cleanly.
-2. **`DmaCopyBackend` builds copy params once at init** (`vllm/v1/simple_kv_offload/copy_backend.py:46-47`). It's tied to a single (gpu_caches, cpu_caches) pair. We'll run **one backend per pool** (two `DmaCopyBackend` instances) rather than rewriting `build_params` — smaller blast radius and clearer ownership.
-3. **KVCacheCoordinator is fully per-instance** (`vllm/v1/core/kv_cache_coordinator.py:28-78`) — safe to instantiate two.
-4. **No cross-pool lookups anywhere in the existing API surface** — `find_longest_cache_hit` takes the block_pool explicitly.
+1. **Block-hash collisions across tiers**: `BlockPool.cached_block_hash_to_block` is instance-scoped (`vllm/v1/core/block_pool.py:171`) and keys embed group_id (`vllm/v1/core/kv_cache_utils.py:53-72`) — but **not** a tier identifier. With partitioned admission, the same prompt hash from two different requests at different priorities could in principle land in *both* tiers' maps. M1 accepts this: both maps may legitimately contain the same hash (different physical block, same logical content), and the load path resolves it by checking both and taking the longer hit. Each block is still in **exactly one tier** — the cross-tier-hash case happens because two requests both computed it, not because we duplicated.
+2. **`DmaCopyBackend` builds copy params once at init** (`vllm/v1/simple_kv_offload/copy_backend.py:46-47`). It's tied to a single (gpu_caches, cpu_caches) pair. We'll run **one backend per tier** (two `DmaCopyBackend` instances). Each handles only GPU↔its-own-CPU-tier; **no host↔host backend is needed** in M1 since there are no inter-tier copies.
+3. **`KVCacheCoordinator` is fully per-instance** (`vllm/v1/core/kv_cache_coordinator.py:28-78`) — safe to instantiate two.
+4. **No cross-pool lookups in the existing API surface** — `find_longest_cache_hit` takes the block_pool explicitly, so iterating fast then slow is the natural extension.
+5. **`Request.priority` is plumbed end-to-end already** (`vllm/v1/request.py:73`, `vllm/v1/engine/llm_engine.py:218`, `vllm/v1/engine/async_llm.py:292`). The connector receives the `Request` object in `update_state_after_alloc` and can read `request.priority` directly. No new API surface, no upstream changes.
 
 ## Design
 
 ### New abstraction: `CpuTier`
 
 A thin container bundling everything that's currently singular in `SimpleCPUOffloadScheduler`/`Worker`:
-- scheduler side: the `KVCacheCoordinator` + its `BlockPool` + an LRU ordering (we need explicit LRU for demotion — today's code relies on `BlockPool`'s free-list recency, which is not directly queryable for "pick LRU victim for demotion").
+- scheduler side: the `KVCacheCoordinator` + its `BlockPool` (vanilla; no subclass).
 - worker side: the pinned CPU tensor dict + its `DmaCopyBackend` instance.
 
-Scheduler holds `self._fast: CpuTier` and `self._slow: CpuTier | None`. Worker mirrors with two tier objects.
+Scheduler holds `self._fast: CpuTier | None` and `self._slow: CpuTier | None`. Worker mirrors with two tier objects. When `fast_cpu_bytes == 0`, `_fast` is `None` and the connector behaves like today's single-pool slow-only configuration.
+
+`CpuTier` is intentionally **symmetric** — nothing about "fast" vs "slow" leaks into its definition. Asymmetry lives at the scheduler's admission decision (which tier to route a given request's blocks to), not in the tier abstraction itself. This keeps the door open for future placement modes (`hybrid`, `replicate`) to reuse the same `CpuTier` without refactoring.
 
 ### Scheduler-side changes (`vllm/v1/simple_kv_offload/manager.py`)
 
-**Initialization**: `SimpleCPUOffloadScheduler.__init__` builds two coordinators via the existing `_derive_cpu_config` helper, once per tier. If `slow_cpu_bytes == 0`, skip the slow tier and fall back to today's single-pool path (trivial branch — keeps backward-compat clean).
+**Initialization**: `SimpleCPUOffloadScheduler.__init__` builds 0, 1, or 2 coordinators based on capacity config. Each coordinator uses the existing `_derive_cpu_config` helper. The result is one `BlockPool` per active tier — no subclasses, no overrides.
 
-**`get_num_new_matched_tokens` (`manager.py:211-231`)**: check fast first, then slow; return the longer hit. Returning the union of matches requires care — stick to "longest contiguous from one tier" for M1. If fast hit ≥ slow hit, use fast; else use slow.
+**Admission helper** (new method): `_choose_tier(request: Request) -> CpuTier` — returns `_fast` if `request.priority < priority_threshold` and `_fast is not None`, else `_slow`. This is the only place that consults priority; everywhere else operates on the chosen tier opaquely.
 
-**`update_state_after_alloc` (`manager.py:235-316`)**: extend `cpu_hit_blocks` discovery across both tiers. Build one `LoadRequestState` with a `TransferMeta` that also carries the *source tier* for each block (new field: `cpu_tiers: list[int]` parallel to `cpu_block_ids`, values 0=fast, 1=slow). Touch blocks in the correct pool.
+**`get_num_new_matched_tokens` (`manager.py:211-231`)**: check both tiers' coordinators for prefix-cache hits and return the longer one. (If only one tier exists, behavior is unchanged from today.) Return the tier identity alongside the length so `update_state_after_alloc` knows which pool to touch.
 
-**`_prepare_eager_store_specs` (`manager.py:446-582`)**:
-- Primary store target is fast. Same logic as today.
-- Skip blocks already present in **either** fast or slow (check both `cached_block_hash_to_block` maps) to preserve the exclusive-placement invariant.
-- **Demotion is allocator-driven, not capacity-driven.** The current code's `num_free <= 0` check is *not* the right demotion trigger: `BlockPool.get_num_free_blocks()` returns `free_block_queue.num_free_blocks`, which already includes cached blocks with `ref_cnt == 0` (they stay on the free queue until popped). When `num_free == 0`, every block in the pool is actively pinned (`ref_cnt > 0`) and nothing is demotable. Demoting a pinned block would corrupt an in-flight transfer.
-- Correct trigger: **intercept the cached-block eviction inside the fast tier's allocator.** `BlockPool.get_new_blocks()` (block_pool.py:322) pops from `free_block_queue` and calls `_maybe_evict_cached_block()` (block_pool.py:354) whenever the popped block carries a `block_hash`. That call-site is exactly "I'm about to drop cached data on the floor" — we redirect it to "copy this cached data to slow, then drop from fast." The free queue is already LRU-ordered for cached blocks, so **no side LRU structure is needed**; `BlockPool` already picks the victim we want.
+**`update_state_after_alloc` (`manager.py:235-316`)**:
+- For the **store path** (new admission): call `_choose_tier(request)` once and route all of this request's eligible-to-store blocks to that tier. The tier choice is recorded in `LoadRequestState` / `StoreRequestState`.
+- For the **load path** (cache-hit serving): blocks may be hit in either tier. Build the `TransferMeta` with a per-block `cpu_tier: int` field (0 = fast, 1 = slow) so the worker copies from the right pool.
+- Touch blocks in the correct tier's `BlockPool` to prevent eviction during the in-flight transfer.
 
-**Fast-tier demotion hook**: rather than modify upstream `BlockPool`, we subclass it (`FastTierBlockPool` in `vllm/v1/simple_kv_offload/tier.py`) and override `_maybe_evict_cached_block`. On eviction of a cached block we:
-1. Look up the block's hash + payload,
-2. Allocate a slow-tier block for it (falling back to the base eviction behavior — i.e. truly drop — when slow has no capacity either),
-3. Enqueue a fast→slow CPU-to-CPU copy as a demote event in the next `build_connector_meta`,
-4. Let the original eviction complete (block becomes free and returns to the caller).
-
-The net effect: from the allocator's perspective `get_new_blocks` still returns as many blocks as requested; from the cache's perspective, hashes migrate fast→slow instead of disappearing. Cap queued demotions per step by the number of free slow blocks to keep `build_connector_meta` bounded.
+**Store path (`_prepare_eager_store_specs`)**:
+- For each request, the tier was chosen at admission. Iterate the request's new blocks and store them to that tier's `BlockPool` only.
+- Each tier evicts its own LRU when full, using `BlockPool`'s native behavior — *no* `FastTierBlockPool` subclass, *no* override of `_maybe_evict_cached_block`. When eviction happens, the block is dropped (the existing `BlockPool` semantic). Other tiers are not consulted.
+- Blocks already present in this tier's `cached_block_hash_to_block` are skipped (existing behavior). The other tier's map is **not** consulted for skip decisions — if the same hash exists in both tiers (because two requests at different priorities both computed it), each tier can keep its own copy. This does not violate "exclusive placement": each *physical block* still lives in exactly one tier; the duplication is logical (same hash) only.
 
 **Metadata (`vllm/v1/simple_kv_offload/metadata.py`)**: extend `SimpleCPUOffloadMetadata`:
-- `load_cpu_tiers: list[int]` parallel to `load_cpu_blocks`
-- `store_cpu_tier: int` — fast (0) or slow (1) destination for each store event (stores are homogeneous per event for M1)
-- New event lists for CPU→CPU demotions: `demote_event: int`, `demote_src_blocks: list[int]`, `demote_dst_blocks: list[int]`
+- `load_cpu_tiers: list[int]` parallel to `load_cpu_blocks`. The worker uses this to copy each load-source block from the right pool.
+- `store_cpu_tier: int` — fast (0) or slow (1) destination for the store event. Stores in M1 are homogeneous per event (one event per tier per step); the scheduler emits up to 2 store events per step, one per tier.
+- **No demote events.** The cascade design's `demote_event`/`demote_src_blocks`/`demote_dst_blocks` fields are dropped.
 
-`build_connector_meta` emits up to 3 events per step (load, store-to-fast, demote-fast-to-slow). Keep existing per-event counter semantics.
+`build_connector_meta` emits up to **3 events per step**: load (single, can have blocks from either tier indexed by `load_cpu_tiers`), store-to-fast, store-to-slow.
 
-**Completion handling (`_process_store_event`, `_process_store_completion`)**: route completions to the correct tier. Add `_process_demote_event` that inserts the block's hash into the slow tier's `cached_block_hash_to_block` map (the fast-side entry was already removed synchronously by `FastTierBlockPool._maybe_evict_cached_block` before the demote was enqueued, preserving the exclusive-placement invariant even while the host-to-host copy is in flight — readers that hit the hash post-eviction will find it in slow).
+**Completion handling**: existing single-tier completion logic applies to each tier independently. No cross-tier completion ordering, no `_process_demote_event`.
 
 ### Worker-side changes (`vllm/v1/simple_kv_offload/worker.py`)
 
-**`register_kv_caches` (`worker.py:66-182`)**: allocate pinned CPU tensors for **both** tiers, size each from its own `num_cpu_blocks`. Two `DmaCopyBackend` instances: `_fast_backend`, `_slow_backend`. Reuse the same `load_stream` / `store_stream` pair across backends — CUDA can serialize ops on one stream without issue, and we get predictable ordering.
+**`register_kv_caches` (`worker.py:66-182`)**: allocate pinned CPU tensors for **both** tiers, size each from its own `num_cpu_blocks`. Two `DmaCopyBackend` instances: `_fast_backend`, `_slow_backend`. Each backend talks to its own tier's pinned-memory region; neither sees the other. Reuse the same `load_stream` / `store_stream` pair across backends — CUDA can serialize ops on one stream, and we get predictable ordering.
 
-**Demotion backend**: a **third** `DmaCopyBackend` or a direct CPU memcpy path. For M1 simplicity, add a tiny `_demote_backend` that builds `BatchMemcpyParams(src=fast_cpu_caches, dst=slow_cpu_caches, stream=store_stream)`. `cuMemcpyBatchAsync` works for host→host with pinned memory. No new kernel needed.
+**No demotion backend.** No host→host copy path needed. (This was a known correctness risk in the previous cascade design; partitioned mode removes it entirely.)
 
-**`get_finished`**: launch all three event types (load, store, demote). Poll the same event lists, now split 3-ways. Report completed demote events via a new field on `SimpleCPUOffloadWorkerMetadata`.
+**`get_finished`**: launch up to three event types per step (load + 2 stores). The load event may target either tier per-block (worker reads `load_cpu_tiers` from metadata to dispatch each block to the correct backend). Store events are homogeneous per tier, dispatched to whichever backend matches `store_cpu_tier`.
 
 ### Critical files to modify
 
 | File | Change |
 |---|---|
-| `vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py` | Parse `fast_cpu_bytes` / `slow_cpu_bytes` from `extra_config`; backward-compat alias `cpu_bytes_to_use` → `fast_cpu_bytes`. Log both capacities. |
-| `vllm/v1/simple_kv_offload/tier.py` **(new)** | `CpuTier` dataclass; `FastTierBlockPool(BlockPool)` subclass overriding `_maybe_evict_cached_block` to redirect cached-block evictions into fast→slow demote events. |
-| `vllm/v1/simple_kv_offload/manager.py` | Dual-coordinator construction (fast uses `FastTierBlockPool`); cross-tier load path; demote-event plumbing; `_process_demote_event`. |
-| `vllm/v1/simple_kv_offload/worker.py` | Dual pinned-tensor allocation; two `DmaCopyBackend` instances + demote backend; launch + poll three event streams. |
-| `vllm/v1/simple_kv_offload/metadata.py` | Extend metadata dataclasses with tier fields + demote event. |
-| `vllm/v1/simple_kv_offload/copy_backend.py` | No change expected — verify host→host with pinned-memory works via existing `cuMemcpyBatchAsync`; if not, add a thin `MemcpyKind.HostToHost` path. |
+| `vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py` | Parse `fast_cpu_bytes`, `slow_cpu_bytes`, `priority_threshold` from `extra_config`. Backward-compat: legacy `cpu_bytes_to_use` → `slow_cpu_bytes` with `fast_cpu_bytes=0`. Log both capacities and the threshold. |
+| `vllm/v1/simple_kv_offload/tier.py` **(new)** | `CpuTier` dataclass (symmetric — `KVCacheCoordinator`, `BlockPool`, capacity). No `BlockPool` subclass. |
+| `vllm/v1/simple_kv_offload/manager.py` | Dual-coordinator construction; `_choose_tier(request)` admission helper; cross-tier load lookup; per-block tier hint in load metadata. |
+| `vllm/v1/simple_kv_offload/worker.py` | Dual pinned-tensor allocation; two `DmaCopyBackend` instances; per-block tier dispatch on load. |
+| `vllm/v1/simple_kv_offload/metadata.py` | Add `load_cpu_tiers: list[int]` and `store_cpu_tier: int` fields. **Drop** demote-event fields. |
 
-**Not modified for M1**: `OffloadingConnector`, `MultiConnector`, `KVCacheCoordinator`, upstream `BlockPool` (we only *subclass* it — no edits to `vllm/v1/core/block_pool.py`).
+**Not modified for M1**: `OffloadingConnector`, `MultiConnector`, `KVCacheCoordinator`, `BlockPool` (no subclass either — vanilla `BlockPool` per tier), `DmaCopyBackend` (no host→host extension needed).
 
 ## Out of scope for M1
 
+- **Inclusive cascade (the existing-connector behavior)**: M1 does not implement fast→slow demotion on eviction. That's deliberate — cascade is what the existing connectors already do, and the project's novelty is precisely *not* doing that. If a deployment wants cascade, the existing `SimpleCPUOffloadConnector` already does it.
 - **Asymmetric performance between the two pools** — M1 is a functional emulation; both pools are pinned DRAM. Real secondary fast memory backings (NUMA-local, CXL-attached, near-accelerator vmem, NVMe, etc.) are follow-up work.
-- **Placement modes other than `exclusive`** — `hybrid` (partial replication) and `replicate` (full replication) are described in the [resiliency RFC](hillock-vmem-resiliency.md). M1's config surface is shaped so adding a `placement_mode` knob later does not break existing configs.
+- **Placement modes other than `partitioned`** — `hybrid` and `replicate` are described in the [resiliency RFC](hillock-vmem-resiliency.md). M1's config surface is shaped so adding a `placement_mode` knob later does not break existing configs.
 - **Resiliency (hot-failure detection & failover)** — see [resiliency RFC](hillock-vmem-resiliency.md); M1 implements none of it.
-- **Model sharing with read-only / externally-managed tiers** — the variant of `replicate` mode covering use case 3 above. Not in M1; M1's `CpuTier` abstraction is shaped to accommodate it (no assumption that the connector owns tier lifecycle), but neither implementation nor full design is in scope here.
-- Lazy mode tiering (keep lazy path single-pool or disabled when `slow_cpu_bytes>0`)
-- Promotion on slow-tier load hit
-- HMA multi-group interaction (slow pool shares groups with fast → should Just Work but untested)
-- Metrics / observability — add only a log line per tier
+- **Model sharing with read-only / externally-managed tiers** — the variant of `replicate` covering use case 3 above. Not in M1; M1's `CpuTier` abstraction does not foreclose it.
+- **Sophisticated admission policies** — M1 only routes by `Request.priority` against a single threshold. Reuse-frequency-based, request-size-based, or learned admission policies are out of scope. The `_choose_tier` helper is a clear seam for swapping these in.
+- **Promotion on slow-tier load hit** — partitioned design has no need for promotion (a request's blocks live where it was admitted).
+- HMA multi-group interaction (slow pool shares groups with fast → should Just Work but untested).
+- Metrics / observability — add only a log line per tier and per-tier hit counters.
 
 ## Relationship to the resiliency proposal
 
@@ -150,23 +159,27 @@ A companion RFC, [hillock-vmem-resiliency.md](hillock-vmem-resiliency.md), owns 
 
 What M1 must *not* foreclose so the resiliency proposal remains cheap to land later:
 
-- `CpuTier` is a **symmetric abstraction** — nothing about "fast" vs "slow" leaks into the code paths that `placement_mode` will later flip. The only asymmetry (demotion direction) lives inside `FastTierBlockPool` and is easy to replace per mode.
-- Worker metadata already carries per-block source-tier hints (`load_cpu_tiers: list[int]` in the M1 design above). That field generalizes to "valid tiers in preference order" without a schema change.
-- `DmaCopyBackend.launch_copy` has no `timeout_ms` parameter today. Leaving the signature unchanged in M1 is fine; the resiliency proposal adds it as an optional kwarg.
-- `CpuTier` does **not** assume the connector owns the tier's lifecycle. M1 does happen to allocate and free both pools internally, but the abstraction must allow a future tier where allocation, write, and eviction are owned by an external manager (the model-sharing / read-only variant of `replicate`). Concretely: a tier's "store" path must be conditional on a writability flag, and the connector's eviction logic must tolerate a tier where blocks appear and disappear independently of connector actions.
+- **`CpuTier` is a symmetric abstraction.** Nothing about "fast" vs "slow" leaks into its definition. The only asymmetry — which tier a request is admitted to — lives in the `_choose_tier(request)` method on the manager, easy to replace per mode.
+- **Worker metadata already carries per-block source-tier hints** (`load_cpu_tiers: list[int]`). That field generalizes to "valid tiers in preference order" without a schema change, which is what `replicate`'s failover needs.
+- **`DmaCopyBackend.launch_copy` has no `timeout_ms` parameter today.** Leaving the signature unchanged in M1 is fine; the resiliency proposal adds it as an optional kwarg.
+- **`CpuTier` does not assume the connector owns the tier's lifecycle.** M1 happens to allocate and free both pools internally, but the abstraction must allow a future tier where allocation, write, and eviction are owned by an external manager (the model-sharing / read-only variant of `replicate`). Concretely: a tier's "store" path must be conditional on a writability flag, and load-time lookup must tolerate a tier where blocks appear and disappear independently of connector actions.
+- **The store path is a single function call (`_choose_tier` then per-tier store).** `hybrid` and `replicate` swap that function for "store to both" or "store to fast + async mirror to slow" without disturbing eviction or load.
 
 If M1 review uncovers anything that would constrain the resiliency design, we update both RFCs together.
 
 ## Verification
 
 **Unit tests** (new file `tests/v1/simple_kv_offload/test_two_tier_manager.py`):
-1. Build `SimpleCPUOffloadScheduler` with `fast_cpu_bytes=N*block_size`, `slow_cpu_bytes=M*block_size`. Assert two coordinators created, two BlockPools with expected `num_blocks`.
-2. Store 2N blocks → fast fills; next N blocks trigger N demotions to slow. Assert: slow `cached_block_hash_to_block` has N entries, fast has N entries, hashes are disjoint (exclusivity).
-3. Load-path hit precedence: prime fast with hash A, slow with hash B, issue request whose prefix matches B. Assert `TransferMeta.cpu_tiers == [1, ...]` for the slow hits.
-4. Backward compat: config with only legacy `cpu_bytes_to_use` set → `slow` tier is None, behavior identical to current.
+1. **Construction**: build `SimpleCPUOffloadScheduler` with `fast_cpu_bytes=N*block_size`, `slow_cpu_bytes=M*block_size`, `priority_threshold=1`. Assert two coordinators created, two `BlockPool`s with expected `num_blocks`. Both pools are vanilla `BlockPool` (no subclasses).
+2. **Admission routing**: submit one request with `priority=0` and one with `priority=5`. After `update_state_after_alloc`, assert the priority-0 request's blocks land in `_fast.block_pool` and the priority-5 request's blocks land in `_slow.block_pool`. Assert no blocks are duplicated across tiers.
+3. **Independent eviction**: fill fast to capacity with priority-0 traffic. Submit another priority-0 request. Assert fast evicts an LRU victim **and slow is untouched** (no demotion).
+4. **Cross-tier load lookup**: prime fast with prefix A's hash, slow with prefix B's hash. Issue a high-priority request matching prefix B (would normally route to fast for stores, but B's hit is in slow). Assert the load `TransferMeta` carries `cpu_tier=1` for B's blocks and the load is served from slow without a cross-tier copy.
+5. **Same hash in both tiers (allowed)**: submit a priority-0 and a priority-5 request that compute the same prefix. Assert the same hash exists in both `cached_block_hash_to_block` maps (different physical blocks, same logical content). Subsequent loads pick the longer/equally-long hit; no duplication of physical blocks within a single tier.
+6. **Threshold disabled**: with `fast_cpu_bytes=0`, all requests route to slow regardless of priority. Behavior matches single-pool today (back-compat for legacy `cpu_bytes_to_use`).
 
-**Integration test** (extend `tests/v1/simple_kv_offload/test_end_to_end.py` or equivalent; confirm file exists first):
-1. Two-pool run with a small model (e.g. `facebook/opt-125m`) and artificially small `fast_cpu_bytes` so demotion fires. Assert request outputs are bit-identical to the single-pool baseline.
+**Integration test** (extend `tests/v1/simple_kv_offload/test_end_to_end.py` if it exists, else create):
+1. Run a workload mixing high-priority and low-priority requests through a small model (e.g. `facebook/opt-125m`). Monitor per-tier hit counters via the per-tier log lines. Assert: high-priority hits come predominantly from fast, low-priority hits from slow.
+2. Output correctness: for a fixed seed and identical prompts, request outputs are bit-identical regardless of which tier served the prefix-cache hit.
 
 **Manual smoke test** (per AGENTS.md workflow):
 ```bash
@@ -187,20 +200,26 @@ llm = LLM(
         'kv_connector_extra_config': {
             'fast_cpu_bytes': 64 * 1024 * 1024,
             'slow_cpu_bytes': 256 * 1024 * 1024,
+            'priority_threshold': 1,
         },
         'kv_role': 'kv_both',
     }),
 )
-out = llm.generate(['Hello world ' * 100] * 4, SamplingParams(max_tokens=32))
-for o in out: print(o.outputs[0].text)
+# High-priority request (priority=0) → fast tier
+out_hi = llm.generate(['Hello high priority ' * 100], SamplingParams(max_tokens=32), priority=0)
+# Low-priority request (priority=5) → slow tier
+out_lo = llm.generate(['Hello low priority ' * 100], SamplingParams(max_tokens=32), priority=5)
+print(out_hi[0].outputs[0].text)
+print(out_lo[0].outputs[0].text)
 "
 ```
-Expected: logs show `SimpleCPUOffloadConnector: fast=... slow=...` and `demote event N completed` lines during generation.
+Expected: logs show `SimpleCPUOffloadConnector: fast=64.00 MB slow=256.00 MB threshold=1`, and per-tier admission/hit counts confirming the routing happened as specified.
 
 ## Open questions deferred to during-implementation
 
-- Whether `cuMemcpyBatchAsync` accepts `HostToHost` with pinned memory today — if not, add a small path in `cuda_mem_ops.py`. Will verify in code, not blocking plan.
-- Whether `FastTierBlockPool._maybe_evict_cached_block` can safely allocate a slow-tier block synchronously from inside the fast allocator's critical path, or whether we should record "evicted hash + payload pointer" and do the slow-pool allocation one layer up in the manager. First design is simpler; the second is safer if either pool ever holds a lock.
+- **Default `priority_threshold` semantics for two-pool deployments**: `1` is the proposal (default-priority requests → fast; explicit de-prioritization → slow). An alternative is `None` (operator must set explicitly when `fast_cpu_bytes > 0`) — safer against accidental misconfiguration but slightly less ergonomic. Decide during implementation based on how prominent we want the tier-routing knob to feel.
+- **Multi-class admission**: `priority_threshold` admits a binary partition. If a deployment has 3+ priority classes that should route to different tiers, M1 collapses them to "above/below threshold." A future enhancement could make `_choose_tier` consult a list of thresholds or a callable. Out of M1 scope; mentioned to confirm the abstraction permits it.
+- **Per-tier metrics and prefix-hit rate reporting**: the existing connector emits a single hit-rate counter. Two tiers want two counters. Plumbing TBD; trivial code, just needs a place in the metrics interface.
 
 ## Branch & PR plan
 
@@ -212,15 +231,16 @@ Expected: logs show `SimpleCPUOffloadConnector: fast=... slow=...` and `demote e
 
 These map 1:1 to the task list tracked during planning. Each can become a GitHub issue under `project:hillock-vmem`. Checkboxes indicate suggested dependency order (top-down).
 
-- [ ] **[Prep] Verify dev environment + test paths** — confirm `.venv` setup, find existing `tests/v1/simple_kv_offload/`, verify `cuMemcpyBatchAsync` host→host in `cuda_mem_ops.py`.
-- [ ] **[Metadata] Extend `SimpleCPUOffloadMetadata` with tier fields + demote event** — new dataclass fields; extend `aggregate()` on worker metadata.
-- [ ] **[Scheduler] Introduce `CpuTier` + dual coordinators** — refactor `SimpleCPUOffloadScheduler` to hold `_fast` and optional `_slow`; single-tier fallback when `slow_cpu_bytes=0`.
-- [ ] **[Scheduler] Cross-tier load path** — `get_num_new_matched_tokens` + `update_state_after_alloc` check both tiers; `TransferMeta.cpu_tiers` tracks source.
-- [ ] **[Scheduler] Demotion via fast-tier allocator hook** — add `FastTierBlockPool` subclass overriding `_maybe_evict_cached_block`; redirect cached-block evictions into fast→slow demote events; cap queued demotions per step by free slow blocks.
-- [ ] **[Scheduler] Completion handling for 3 event types** — split `_process_store_event` into load/store/demote; hash-map migration on demote completion.
-- [ ] **[Worker] Dual pinned tensors + two `DmaCopyBackend` instances** — allocate per-tier CPU tensors; add `_demote_backend` for host→host.
-- [ ] **[Worker] Launch + poll 3 event streams** — dispatch to correct backend; report completed demote events.
-- [ ] **[Connector] Parse `fast_cpu_bytes` / `slow_cpu_bytes` config** — backward-compat alias; thread capacities to scheduler/worker.
-- [ ] **[Tests] Unit tests for two-tier manager** — dual coordinators, demotion, load precedence, backward compat.
-- [ ] **[Tests] Integration + manual smoke test** — two-pool end-to-end vs single-pool baseline.
+- [ ] **[Prep] Verify dev environment + test paths** — confirm `.venv` setup, find existing `tests/v1/simple_kv_offload/`. Confirm `Request.priority` is reachable from the connector's scheduler-side hook.
+- [ ] **[Connector] Parse `fast_cpu_bytes` / `slow_cpu_bytes` / `priority_threshold` config** — three new config fields; backward-compat for legacy `cpu_bytes_to_use` (→ `slow_cpu_bytes` with `fast_cpu_bytes=0`).
+- [ ] **[Tier abstraction] Introduce `CpuTier`** — new `vllm/v1/simple_kv_offload/tier.py` with the `CpuTier` dataclass. Symmetric, no `BlockPool` subclass.
+- [ ] **[Scheduler] Dual-coordinator construction** — refactor `SimpleCPUOffloadScheduler.__init__` to build 0/1/2 tiers based on capacities. Single-tier (slow only) fallback when `fast_cpu_bytes=0`.
+- [ ] **[Scheduler] `_choose_tier(request)` admission helper** — read `request.priority`, return the destination tier. Single point of asymmetry.
+- [ ] **[Scheduler] Per-tier store routing** — `_prepare_eager_store_specs` consults `_choose_tier` per request and stores to that tier's `BlockPool` only. Each tier evicts independently using vanilla `BlockPool` LRU.
+- [ ] **[Scheduler] Cross-tier load lookup** — `get_num_new_matched_tokens` + `update_state_after_alloc` check both tiers' `cached_block_hash_to_block`; `TransferMeta` carries per-block `cpu_tier` so the worker copies from the right pool.
+- [ ] **[Metadata] Add tier hints to `SimpleCPUOffloadMetadata`** — `load_cpu_tiers: list[int]`, `store_cpu_tier: int`. No demote-event fields.
+- [ ] **[Worker] Dual pinned tensors + two `DmaCopyBackend` instances** — allocate per-tier CPU tensors; one backend per tier. No host↔host backend.
+- [ ] **[Worker] Per-block tier dispatch** — load path reads `load_cpu_tiers` and routes each block to its tier's backend; store path uses `store_cpu_tier`.
+- [ ] **[Tests] Unit tests for partitioned manager** — admission routing, independent eviction, cross-tier load lookup, same-hash-in-both-tiers, threshold-disabled back-compat.
+- [ ] **[Tests] Integration + manual smoke test** — mixed-priority workload; per-tier hit counters; output bit-exactness.
 - [ ] **[Release] Lint, pre-commit, open draft PR** — per `AGENTS.md` workflow.
