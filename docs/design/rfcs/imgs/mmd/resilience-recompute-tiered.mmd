@@ -1,0 +1,18 @@
+%% Resilience scenario 2 (exclusive tiered): when the secondary fast
+%% memory pool fails, requests whose KV blocks lived only there must
+%% re-prefill on the accelerator. Slow-pool requests are unaffected.
+flowchart LR
+    Acc["Accelerator"]
+    HBM["HBM"]
+    Acc --- HBM
+
+    SecMem["Secondary fast memory pool<br/>(unresponsive)"]:::dead
+    Slow["Slow host DRAM pool<br/>(healthy)"]:::ok
+
+    HBM x--x|"high-priority blocks<br/>were exclusively here"| SecMem
+    HBM <-->|low-priority blocks<br/>continue normally| Slow
+
+    HBM ==>|"recompute (re-prefill)<br/>requests whose KV<br/>was in the dead tier"| HBM
+
+    classDef dead fill:#fee,stroke:#c00,stroke-dasharray:5 5
+    classDef ok fill:#e8f5e0,stroke:#3a8a1a

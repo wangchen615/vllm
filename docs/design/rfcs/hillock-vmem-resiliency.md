@@ -1,22 +1,25 @@
-# hillock-vmem: resiliency across the memory hierarchy — design proposal
+# Secondary memory system: resiliency across the memory hierarchy — design proposal
 
 | | |
 | --- | --- |
 | **Status** | Proposal (no implementation yet) |
-| **Project** | hillock-vmem |
 | **Owner** | @wangchen615 |
 | **Created** | 2026-05-12 |
 | **Companion** | [hillock-vmem-two-tier-offload.md](hillock-vmem-two-tier-offload.md) (M1 functional emulation — prerequisite) |
+| **Parent** | [secondary-memory-system-overview.md](secondary-memory-system-overview.md) |
+| **Siblings** | [exclusive-tiered-caching.md](exclusive-tiered-caching.md), [inclusive-hierarchical-caching.md](inclusive-hierarchical-caching.md) |
 
 ## Context
 
-The hillock-vmem project targets a **three-level memory hierarchy** for LLM KV cache:
+This RFC targets a **three-level memory hierarchy** for LLM KV cache:
 
 ```text
   GPU HBM  ↔  secondary fast memory system  ↔  slow DRAM on host
 ```
 
 A companion RFC ([hillock-vmem-two-tier-offload.md](hillock-vmem-two-tier-offload.md)) covers **M1**: a functional emulation of that hierarchy using two CPU memory pools as stand-ins for the secondary fast memory system and the slow DRAM on host. M1 proves the Simple KV-offload connector can manage two address spaces with small, scoped changes.
+
+> **Terminology**: This document uses neutral hardware-agnostic names — **secondary fast memory** for the novel middle tier and **accelerator** for any device that owns HBM. See [secondary-memory-system-overview.md §Terminology](secondary-memory-system-overview.md#terminology).
 
 **This RFC covers the next question**: once the hierarchy is real, how do we exploit its natural redundancy to keep serving through memory-tier failures?
 
@@ -35,6 +38,32 @@ Both use cases share the same core mechanism — blocks live in multiple tiers �
 
 A real three-level hierarchy is **naturally redundant**: when the secondary fast memory system and the slow DRAM on host both participate in KV offload, some blocks end up on both. A resilient design exploits that redundancy so a memory-tier hiccup doesn't take out live requests.
 
+The diagrams below illustrate the three resiliency scenarios this RFC has to cover.
+
+#### Scenario A — cross-deployment recovery from a failed accelerator
+
+When one model deployment loses its accelerator (and with it, its HBM), another surviving deployment can fetch the failed deployment's high-priority / popular KV blocks from the **shared secondary fast memory pool** and resume in-flight requests without a cold re-prefill.
+
+<img alt="Failed deployment's HBM is gone, but its KV blocks remain in the shared secondary fast memory pool; surviving deployment fetches them into its own HBM" src="imgs/svg/resilience-cross-deployment.svg" width="720">
+
+Source: [`imgs/mmd/resilience-cross-deployment.mmd`](imgs/mmd/resilience-cross-deployment.mmd).
+
+#### Scenario B — recompute on tier failure (exclusive tiered)
+
+Under [exclusive tiered caching](exclusive-tiered-caching.md), a high-priority request's KV blocks live **only** in the secondary fast memory pool. If that pool fails, those requests **re-prefill** on the accelerator. Slow-pool requests are unaffected.
+
+<img alt="Secondary fast memory pool unresponsive; high-priority requests recompute on the accelerator; slow pool requests continue normally" src="imgs/svg/resilience-recompute-tiered.svg" width="720">
+
+Source: [`imgs/mmd/resilience-recompute-tiered.mmd`](imgs/mmd/resilience-recompute-tiered.mmd).
+
+#### Scenario C — prefetch from slow on tier failure (inclusive hierarchical)
+
+Under [inclusive hierarchical caching](inclusive-hierarchical-caching.md), the slow tier is a **superset** of the fast tier. Every block that was in fast also exists in slow. When the fast tier fails, recovery is a **prefetch from slow into HBM** — no re-prefill needed.
+
+<img alt="Secondary fast memory pool unresponsive; slow host DRAM pool is a superset and prefetches every missing block back into HBM; requests resume" src="imgs/svg/resilience-prefetch-hierarchical.svg" width="720">
+
+Source: [`imgs/mmd/resilience-prefetch-hierarchical.mmd`](imgs/mmd/resilience-prefetch-hierarchical.mmd).
+
 Concretely, a production deployment may face:
 
 - **Transient stalls** — a CXL link flaps, a remote NUMA node wedges, an ioctl hangs, an out-of-band firmware event takes a tier unresponsive for seconds.
@@ -45,13 +74,13 @@ In all three cases the vLLM process is alive and other requests are still flowin
 
 ### Use case 2: model sharing for agentic workflows
 
-In a heavy-overcommit agentic deployment, many small models are loaded and unloaded across many accelerators (e.g. several Spyre devices) on rapid time-scales — request-driven model switches measured in seconds, not minutes. Re-fetching each model from object storage on every switch is unacceptably slow.
+In a heavy-overcommit agentic deployment, many small models are loaded and unloaded across many accelerators on rapid time-scales — request-driven model switches measured in seconds, not minutes. Re-fetching each model from object storage on every switch is unacceptably slow.
 
-The hillock-vmem hierarchy can address this by treating the secondary fast memory tier as a **shared, canonical home for model weights**:
+The secondary-memory hierarchy can address this by treating the secondary fast memory tier as a **shared, canonical home for model weights**:
 
-- The model is loaded once into Hillock-backed memory by an external manager (the platform, not vLLM).
+- The model is loaded once into the secondary fast memory pool by an external manager (the platform, not vLLM).
 - Each accelerator that wants to serve the model **reads** it in from the shared tier on demand.
-- The model **stays canonical in Hillock** even after an accelerator finishes — the next switch back is a fast read, not a re-load from object storage.
+- The model **stays canonical in the secondary fast memory pool** even after an accelerator finishes — the next switch back is a fast read, not a re-load from object storage.
 - Multiple accelerators can read the same model concurrently.
 
 This is `replicate` semantically (the same data lives in the shared tier *and* in each executor's working set), with two extensions that distinguish it from the resiliency case:
@@ -77,7 +106,7 @@ Resiliency is fundamentally a **placement** question: *do blocks live in one tie
 | **hybrid** | New stores go to fast; a bounded async mirror also writes to slow. Under capacity pressure the mirror is dropped (degrades to `partitioned`-like single-tier residence). | Between `min(fast, slow)` and `fast + slow` depending on pressure | Partial — recently-stored hot blocks are replicated, older ones may not be | No |
 | **replicate** | Every store goes to both tiers. Loads prefer fast; slow is used on fast-miss or fast-failure. | `min(fast, slow)` | **Full** — either tier alone is sufficient to continue serving | No |
 
-> **Cascade is deliberately *not* one of these modes.** Cascade (write-fast, demote-on-eviction) is what `OffloadingConnector` and `SimpleCPUOffloadConnector` already do. hillock-vmem's novelty is `partitioned` (M1) and `replicate` / `hybrid` (this RFC); cascade adds nothing new and doesn't compose well with the others (mixing demotion with replication produces ambiguous "where does this block live?" questions). If a deployment wants cascade, the existing connectors serve it.
+> **Cascade is split off into its own RFC, not one of these modes.** A two-CPU-tier inclusive cascade (write-fast, demote-on-eviction, slow as superset) is the subject of [inclusive-hierarchical-caching.md](inclusive-hierarchical-caching.md) — it is design-only future work and does not compose cleanly with `replicate` / `hybrid` (mixing demotion with replication produces ambiguous "where does this block live?" questions). The single-CPU-pool cascade that `OffloadingConnector` and `SimpleCPUOffloadConnector` already implement remains the right choice for deployments that want cascade today.
 
 The mode is selected at connector init via a new `kv_connector_extra_config.placement_mode` field (default `"partitioned"`, preserving M1 behavior). Users pick where on the spectrum they sit based on workload:
 
@@ -102,7 +131,7 @@ The connector exposes two new per-tier flags to encode this:
 - `tier.writable: bool` — if `False`, the connector never issues store ops against this tier. Only loads.
 - `tier.externally_managed: bool` — if `True`, the connector treats the tier's contents as authoritative-but-volatile; cache lookups respect what's there but don't assume a block stays around between scheduler steps. This affects the load path's "still cached?" recheck logic.
 
-These flags are orthogonal to `placement_mode`. A `replicate` deployment for resiliency uses `writable=true, externally_managed=false` for both tiers. A `replicate` deployment for model sharing uses `writable=true, externally_managed=false` for the executor-local fast tier and `writable=false, externally_managed=true` for the shared Hillock-backed slow tier. (Future deployments may mix all four combinations.)
+These flags are orthogonal to `placement_mode`. A `replicate` deployment for resiliency uses `writable=true, externally_managed=false` for both tiers. A `replicate` deployment for model sharing uses `writable=true, externally_managed=false` for the executor-local fast tier and `writable=false, externally_managed=true` for the shared secondary-fast-memory-backed slow tier. (Future deployments may mix all four combinations.)
 
 The implementation impact on the connector is small once `placement_mode` is in: skip stores for `writable=false` tiers, and add a freshness check on load for `externally_managed=true` tiers.
 

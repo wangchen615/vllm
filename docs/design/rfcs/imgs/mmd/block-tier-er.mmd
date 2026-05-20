@@ -1,0 +1,36 @@
+%% Entity-relationship diagram: how a logical KV block hash relates to
+%% physical block IDs across tiers, and to the metadata that tracks them.
+erDiagram
+    BLOCK_HASH ||--o{ TIER_RESIDENCE : "lives in N tiers (N=1 exclusive, N≥1 inclusive)"
+    TIER_RESIDENCE }o--|| TIER : "is a slot in"
+    TIER ||--|| BLOCK_POOL : "owned by"
+    BLOCK_POOL ||--o{ PHYSICAL_BLOCK : "manages"
+    TIER_RESIDENCE }|--|| PHYSICAL_BLOCK : "occupies one"
+
+    REQUEST ||--o{ BLOCK_HASH : "produces / consumes"
+    REQUEST {
+        int priority
+        string req_id
+    }
+
+    BLOCK_HASH {
+        bytes hash
+        int group_id
+    }
+
+    TIER {
+        int tier_id
+        bool writable
+        bool externally_managed
+    }
+
+    TIER_RESIDENCE {
+        int physical_block_id
+        int tier_id
+        int ref_count
+    }
+
+    PHYSICAL_BLOCK {
+        int block_id
+        int tier_id
+    }

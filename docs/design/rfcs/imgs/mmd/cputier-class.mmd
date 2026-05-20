@@ -1,0 +1,59 @@
+%% Class diagram: the CpuTier abstraction and how it relates to existing
+%% vLLM types (KVCacheCoordinator, BlockPool, DmaCopyBackend).
+classDiagram
+    class CpuTier {
+        +int tier_id
+        +int num_blocks
+        +KVCacheCoordinator coordinator
+        +BlockPool block_pool
+        +Tensor[] cpu_caches
+        +DmaCopyBackend dma
+        +TierHealth health  ⟵ resiliency RFC
+        +bool writable      ⟵ resiliency RFC
+        +bool externally_managed  ⟵ resiliency RFC
+    }
+
+    class SimpleCPUOffloadScheduler {
+        -CpuTier _fast
+        -CpuTier _slow
+        +_choose_tier(request) CpuTier
+        +get_num_new_matched_tokens(request) int
+        +update_state_after_alloc(request) None
+        +build_connector_meta() SimpleCPUOffloadMetadata
+    }
+
+    class SimpleCPUOffloadWorker {
+        -CpuTier _fast
+        -CpuTier _slow
+        +register_kv_caches(gpu_caches) None
+        +start_load_kv(meta) None
+        +wait_for_save() None
+        +get_finished() (loaded, stored)
+    }
+
+    class KVCacheCoordinator {
+        +find_longest_cache_hit(...)
+        +allocate_slots(...)
+        +free(...)
+    }
+
+    class BlockPool {
+        +int num_gpu_blocks
+        +cached_block_hash_to_block
+        +free_block_queue
+        +get_num_free_blocks() int
+    }
+
+    class DmaCopyBackend {
+        +init(gpu_caches, cpu_caches, ...)
+        +launch_copy(src, dst, is_store, ...)
+        +shutdown()
+    }
+
+    SimpleCPUOffloadScheduler --> CpuTier : holds 1..2
+    SimpleCPUOffloadWorker --> CpuTier : holds 1..2
+    CpuTier --> KVCacheCoordinator : owns
+    CpuTier --> BlockPool : owns
+    CpuTier --> DmaCopyBackend : owns
+
+    note for CpuTier "Symmetric abstraction.<br/>No 'fast'-vs-'slow' asymmetry leaks<br/>into code paths — required so future<br/>placement modes (replicate, hybrid)<br/>can flip behavior without invasive change."

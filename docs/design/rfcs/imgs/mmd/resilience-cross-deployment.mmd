@@ -1,0 +1,27 @@
+%% Resilience scenario 1: KV cache sharing across model deployments.
+%% When one accelerator and its vLLM server crashes, another can fetch
+%% high-priority and popular KV blocks from the shared secondary fast
+%% memory pool to resume in-flight requests without a cold re-prefill.
+flowchart LR
+    subgraph DepA["Failed deployment"]
+        AccA["Accelerator A<br/>crashed"]:::dead
+        HBM_A["HBM lost"]:::dead
+    end
+
+    subgraph SecMem["Shared secondary fast memory pool"]
+        Blocks["High-priority and popular<br/>KV blocks still resident"]:::ok
+    end
+
+    subgraph DepB["Surviving deployment"]
+        AccB["Accelerator B"]:::live
+        HBM_B["HBM"]:::live
+    end
+
+    AccA -.- HBM_A
+    HBM_A -.- Blocks
+    Blocks -->|fetch surviving<br/>KV blocks| HBM_B
+    HBM_B --- AccB
+
+    classDef dead fill:#fee,stroke:#c00,stroke-dasharray:5 5
+    classDef ok fill:#fce4ec,stroke:#880e4f
+    classDef live fill:#e8f5e0,stroke:#3a8a1a

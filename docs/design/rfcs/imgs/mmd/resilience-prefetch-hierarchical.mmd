@@ -1,0 +1,18 @@
+%% Resilience scenario 3 (inclusive hierarchical): when the secondary
+%% fast memory pool fails, the slow host DRAM pool is a SUPERSET, so
+%% every block that was in fast also exists in slow. Recovery is a
+%% prefetch from slow → HBM. No re-prefill needed.
+flowchart LR
+    Acc["Accelerator"]
+    HBM["HBM"]
+    Acc --- HBM
+
+    SecMem["Secondary fast memory pool<br/>(unresponsive)"]:::dead
+    Slow["Slow host DRAM pool<br/>(superset of fast<br/>— still has every block)"]:::ok
+
+    HBM x--x|fast tier offline| SecMem
+    HBM ==>|"prefetch missing<br/>blocks from slow"| Slow
+    Slow ==>|"warm KV back into<br/>HBM, requests resume"| HBM
+
+    classDef dead fill:#fee,stroke:#c00,stroke-dasharray:5 5
+    classDef ok fill:#e6f0ff,stroke:#1a4d99

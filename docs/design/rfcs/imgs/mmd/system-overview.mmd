@@ -1,0 +1,25 @@
+%% System overview: production hardware target for the secondary fast memory tier.
+%% See docs/design/rfcs/secondary-memory-system-overview.md
+flowchart TB
+    subgraph Host["Host"]
+        DRAM["DRAM (slow)"]
+        NVMe["NVMe"]
+    end
+
+    subgraph Pod["Pod / Server (PCIe-switched fabric)"]
+        direction LR
+        AccL["Accelerator L"]
+        HBM_L["HBM"]
+        HBM_R["HBM"]
+        AccR["Accelerator R"]
+        SecMem["Secondary fast memory<br/>(near-accelerator, larger than HBM,<br/>faster than host DRAM to reach)"]
+
+        AccL --- HBM_L
+        AccR --- HBM_R
+        HBM_L <--> SecMem
+        HBM_R <--> SecMem
+    end
+
+    HBM_L <--> Host
+    HBM_R <--> Host
+    SecMem <--> Host

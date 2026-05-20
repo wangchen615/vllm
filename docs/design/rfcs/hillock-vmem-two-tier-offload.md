@@ -1,18 +1,21 @@
-# Two-tier CPU KV offload (hillock-vmem) — M1 plan
+# Two-tier CPU KV offload — M1 plan
 
 | | |
 | --- | --- |
 | **Status** | Draft |
-| **Project** | hillock-vmem |
 | **Branch** | `dev` |
 | **Owner** | @wangchen615 |
 | **Created** | 2026-05-04 |
+| **Component design** | [exclusive-tiered-caching.md](exclusive-tiered-caching.md) (component-level view of this M1 mode) |
+| **Parent** | [secondary-memory-system-overview.md](secondary-memory-system-overview.md) |
 
 ## Context
 
+> **Terminology**: This document uses neutral hardware-agnostic names — **secondary fast memory** for the novel middle tier and **accelerator** for any device that owns HBM. See [secondary-memory-system-overview.md §Terminology](secondary-memory-system-overview.md#terminology).
+
 ### The production target: a three-level memory hierarchy
 
-The `hillock-vmem` project aims for a **three-level memory hierarchy** for LLM KV cache:
+This RFC targets a **three-level memory hierarchy** for LLM KV cache:
 
 ```text
   GPU HBM  ↔  secondary fast memory system  ↔  slow DRAM on host
@@ -28,7 +31,7 @@ The middle tier — the **secondary fast memory system** — is the novel piece.
 
 The hierarchy is not defined by speed alone. A second axis — the **placement policy** — decides which tier holds which blocks, and whether the same block can live in more than one tier. Speed alone gets you a fast lookup path; placement policy decides what each tier is *for*. The two axes are independent and equally first-class.
 
-vLLM's existing offload connectors all implement one specific placement policy: **inclusive cascade** (write to fast, demote to slow on eviction, slow always backs up fast's overflow). hillock-vmem deliberately does *not* do this. The contrast is the project's main novelty:
+vLLM's existing offload connectors all implement one specific placement policy: **inclusive cascade** (write to fast, demote to slow on eviction, slow always backs up fast's overflow). This RFC deliberately does *not* do this for M1. The contrast is the project's main novelty:
 
 | Mode | Semantics | Block can live in… | Inter-tier movement | In M1? |
 | --- | --- | --- | --- | --- |
@@ -48,7 +51,7 @@ These motivate why two *partitioned* tiers (and eventually `hybrid` / `replicate
 
 1. **Class-of-service KV cache for mixed-priority serving** — *driven by `partitioned` mode (M1)*. A serving system handles both latency-sensitive interactive requests and best-effort batch / agentic-background traffic on the same engine. With one undifferentiated CPU pool, low-priority KV evicts (or prevents caching of) high-priority KV. Partitioning by priority gives high-priority requests a smaller, tightly-managed fast tier insulated from low-priority churn, while low-priority requests still benefit from a larger slow-tier cache. **The two tiers cache different sets of KV blocks on purpose** — they're not a fast→slow cascade for the same data.
 2. **Resilient serving across memory-tier failures** — *driven by `hybrid` and `replicate` modes (resiliency RFC)*. A real three-level hierarchy is naturally redundant; placement policy decides whether we exploit that to survive a tier going unresponsive mid-serve.
-3. **Model sharing for agentic workflows with rapid model switches** — *driven by `replicate` mode, with a read-only / externally-managed variant*. Multiple accelerators (e.g. several Spyre devices) each load the same model from a Hillock-backed memory pool. The model stays canonical in Hillock; each executor brings it in to run, but Hillock retains the master copy. This is `replicate` semantically, with two extensions: (a) the slow tier is **read-only** from the connector's perspective — only Hillock writes, executors only read; (b) the slow tier is **externally managed** — the connector doesn't control evictions, the platform does. Heavy model overcommit and rapid model switches in agentic workflows make this a load-bearing use case rather than a curiosity. Out of M1 scope, mentioned here so M1's abstractions don't silently exclude it (e.g., the `CpuTier` abstraction must not assume the connector owns the tier's lifecycle).
+3. **Model sharing for agentic workflows with rapid model switches** — *driven by `replicate` mode, with a read-only / externally-managed variant*. Multiple accelerators each load the same model from a shared secondary-fast-memory-backed pool. The model stays canonical in the shared pool; each executor brings it in to run, but the shared pool retains the master copy. This is `replicate` semantically, with two extensions: (a) the slow tier is **read-only** from the connector's perspective — only the platform writes, executors only read; (b) the slow tier is **externally managed** — the connector doesn't control evictions, the platform does. Heavy model overcommit and rapid model switches in agentic workflows make this a load-bearing use case rather than a curiosity. Out of M1 scope, mentioned here so M1's abstractions don't silently exclude it (e.g., the `CpuTier` abstraction must not assume the connector owns the tier's lifecycle).
 
 ### Why this RFC uses two CPU pools
 

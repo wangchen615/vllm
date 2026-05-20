@@ -1,0 +1,44 @@
+%% Inclusive hierarchical store/load workflow with promotion + demotion.
+sequenceDiagram
+    autonumber
+    participant Sched as Scheduler
+    participant Heat as Heat tracker
+    participant Fast as Fast tier
+    participant Slow as Slow tier
+    participant Worker as Worker
+
+    rect rgba(232,245,224,0.5)
+        note over Sched,Worker: Store path - HBM eviction cascade
+        Sched->>Heat: bump on each cache hit
+        Sched->>Sched: HBM evicts block B
+        alt B reuse_count high and fast has room
+            Sched->>Worker: store B into Fast
+        else
+            Sched->>Worker: store B into Slow
+        end
+    end
+
+    rect rgba(255,243,230,0.5)
+        note over Sched,Slow: Demote path - fast under pressure
+        Fast->>Fast: LRU victim V picked
+        alt V reuse_count high
+            Fast->>Slow: demote V into slow if not present
+        else
+            Fast->>Fast: drop V cold
+        end
+    end
+
+    rect rgba(230,240,255,0.5)
+        note over Sched,Worker: Load path - cache hit
+        Sched->>Fast: lookup
+        alt fast hit
+            Sched->>Worker: load from Fast to GPU
+        else slow hit
+            Sched->>Worker: load from Slow to GPU
+            opt promote_on_load and fast has room
+                Sched->>Worker: copy Slow into Fast async
+            end
+        end
+    end
+
+    note over Fast,Slow: Slow is a SUPERSET of fast. Every block in fast also exists in slow, maintained by demote-before-drop in fast.

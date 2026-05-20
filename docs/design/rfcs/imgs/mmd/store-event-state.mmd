@@ -1,0 +1,11 @@
+%% State machine: lifecycle of a store event from issuance to completion.
+stateDiagram-v2
+    [*] --> Pending : scheduler emits store_event_idx
+    Pending --> InFlight : worker dequeues and launch_copy
+    InFlight --> Completed : torch.Event done and hash inserted into tier cache
+    Completed --> Reported : worker reports via SimpleCPUOffloadWorkerMetadata
+    Reported --> [*] : scheduler accumulates across world_size and frees pending refs
+
+    InFlight --> Failed : resiliency RFC - timeout or DMA error
+    Failed --> Quarantined : tier health goes suspect to quarantined
+    Quarantined --> [*]

@@ -1,0 +1,18 @@
+%% Exclusive tiered caching: high-priority requests' KV blocks live in the
+%% emulated secondary fast memory; lower-priority blocks live in CPU DRAM.
+%% Heat indicates reuse rate (not used as a placement signal in M1 — only
+%% priority is). See docs/design/rfcs/exclusive-tiered-caching.md
+flowchart TB
+    HBM["HBM<br/>(GPU KV cache)"]:::hbm
+
+    Fast["Secondary fast memory pool<br/>holds high-priority requests' KV blocks"]:::fast
+    Slow["Slow host DRAM pool<br/>holds lower-priority requests' KV blocks"]:::slow
+
+    HBM ===|"high-priority<br/>store / load"| Fast
+    HBM ===|"low-priority<br/>store / load"| Slow
+
+    Fast <--->|"no inter-tier movement<br/>(blocks never demoted/promoted)"| Slow
+
+    classDef hbm fill:#fff3e6,stroke:#cc6600,stroke-width:2px
+    classDef fast fill:#e8f5e0,stroke:#3a8a1a,stroke-width:2px
+    classDef slow fill:#e6f0ff,stroke:#1a4d99,stroke-width:2px

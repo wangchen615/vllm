@@ -1,0 +1,19 @@
+%% Emulator overview: how vLLM's SimpleCPUOffloadConnector emulates the
+%% three-level hierarchy with two CPU memory pools.
+%% See docs/design/rfcs/secondary-memory-system-overview.md
+flowchart TB
+    Acc["Accelerator (e.g. GPU/NPU)"]
+    HBM["HBM<br/>(GPU KV cache)"]
+    Acc --- HBM
+
+    subgraph Emu["Emulation: two pinned-host CPU pools (M1)"]
+        Fast["Pool #0: emulated<br/>secondary fast memory<br/>(pinned host DRAM,<br/>small)"]
+        Slow["Pool #1: emulated<br/>slow host DRAM<br/>(pinned host DRAM,<br/>large)"]
+        Fast <--> Slow
+    end
+
+    HBM <-->|cuMemcpyBatchAsync| Fast
+    HBM <-->|cuMemcpyBatchAsync| Slow
+
+    note["Both pools are pinned host DRAM in M1.<br/>No real speed asymmetry — M1 proves<br/>functional management of two address<br/>spaces with small, scoped changes to<br/>SimpleCPUOffloadConnector."]
+    Emu -.- note
