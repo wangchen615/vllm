@@ -1,7 +1,7 @@
 # hillock-vmem: resiliency across the memory hierarchy — design proposal
 
 | | |
-|---|---|
+| --- | --- |
 | **Status** | Proposal (no implementation yet) |
 | **Project** | hillock-vmem |
 | **Owner** | @wangchen615 |
@@ -12,7 +12,7 @@
 
 The hillock-vmem project targets a **three-level memory hierarchy** for LLM KV cache:
 
-```
+```text
   GPU HBM  ↔  secondary fast memory system  ↔  slow DRAM on host
 ```
 
@@ -72,7 +72,7 @@ For both use cases, the relevant property — tier health (use case 1) or tier w
 Resiliency is fundamentally a **placement** question: *do blocks live in one tier, the other, or both?* M1's `partitioned` mode is the non-resilient endpoint. Two more modes fill out the spectrum:
 
 | Mode | Semantics | Effective capacity | Resiliency | In M1? |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | **partitioned** | Each request is admitted to one tier based on a per-request signal (priority). The two tiers cache different sets of blocks. No inter-tier movement. | `fast + slow` (but each tier holds different blocks) | **None** — losing either tier loses whatever was admitted there | **Yes** (the only M1 mode) |
 | **hybrid** | New stores go to fast; a bounded async mirror also writes to slow. Under capacity pressure the mirror is dropped (degrades to `partitioned`-like single-tier residence). | Between `min(fast, slow)` and `fast + slow` depending on pressure | Partial — recently-stored hot blocks are replicated, older ones may not be | No |
 | **replicate** | Every store goes to both tiers. Loads prefer fast; slow is used on fast-miss or fast-failure. | `min(fast, slow)` | **Full** — either tier alone is sufficient to continue serving | No |
@@ -91,7 +91,7 @@ The mode is selected at connector init via a new `kv_connector_extra_config.plac
 The agentic / model-sharing use case (motivation §2) reuses `replicate` semantically — same data lives in two tiers — but with two extensions to the per-tier contract:
 
 | Property | Resiliency `replicate` | Model-sharing `replicate` |
-|---|---|---|
+| --- | --- | --- |
 | Connector writes to slow tier? | Yes (every store mirrored) | **No** — read-only from connector's perspective |
 | Allocation in slow tier | Connector-driven | **Externally driven** (platform manager) |
 | Eviction in slow tier | Connector-driven (LRU) | **Externally driven** — blocks may disappear without connector action |
@@ -140,7 +140,7 @@ Cold-restart recovery (reload KV from the survivor on process boot) is a strictl
 New fields in `kv_connector_extra_config`:
 
 | Field | Type | Default | Effect |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `placement_mode` | `"partitioned" \| "hybrid" \| "replicate"` | `"partitioned"` | Picks the placement policy. |
 | `tier_timeout_ms` | int | `0` (disabled) | Per-op timeout on `DmaCopyBackend.launch_copy`. `0` = no timeout (M1 behavior). |
 | `step_timeout_budget_ms` | int | `5 * tier_timeout_ms` | Total time a single scheduler step will spend on tier ops including retries. Once exceeded, remaining timed-out blocks signal re-prefill rather than retrying. |
@@ -160,6 +160,7 @@ The M1 RFC already carries per-block source-tier hints (`load_cpu_tiers: list[in
 - **New per-block field: `replica_tiers: set[int]`** — the tiers the block is known to exist in (for `replicate` / `hybrid`). Used by the failover read path to decide retry eligibility.
 
 **`replica_tiers` is advisory, not authoritative.** The scheduler updates it on store-completion (insert) and quarantine (remove the quarantined tier), but it is *not* a global lock — the worker may briefly see a block listed in `replica_tiers` that has just been evicted from one of those tiers, and vice versa. The invariant we maintain is one-way: **if `replica_tiers` does *not* list tier T, the block is definitely not in T.** The opposite ("listed → present") is best-effort. Code that consumes `replica_tiers` must handle "miss in the supposed tier" as a normal outcome:
+
 - **Failover**: if retry on slow misses, signal re-prefill (same as if `replica_tiers` had said "slow not present" to begin with).
 - **Re-replication**: if re-replication source-read misses, skip that block and move on.
 
