@@ -5,7 +5,7 @@
 | **Status** | Proposal (no implementation yet) |
 | **Owner** | @wangchen615 |
 | **Created** | 2026-05-12 |
-| **Companion** | [hillock-vmem-two-tier-offload.md](hillock-vmem-two-tier-offload.md) (M1 functional emulation — prerequisite) |
+| **Companion** | [secondary-memory-m1-implementation.md](secondary-memory-m1-implementation.md) (M1 functional emulation — prerequisite) |
 | **Parent** | [secondary-memory-system-overview.md](secondary-memory-system-overview.md) |
 | **Siblings** | [exclusive-tiered-caching.md](exclusive-tiered-caching.md), [inclusive-hierarchical-caching.md](inclusive-hierarchical-caching.md) |
 
@@ -17,7 +17,7 @@ This RFC targets a **three-level memory hierarchy** for LLM KV cache:
   GPU HBM  ↔  secondary fast memory system  ↔  slow DRAM on host
 ```
 
-A companion RFC ([hillock-vmem-two-tier-offload.md](hillock-vmem-two-tier-offload.md)) covers **M1**: a functional emulation of that hierarchy using two CPU memory pools as stand-ins for the secondary fast memory system and the slow DRAM on host. M1 proves the Simple KV-offload connector can manage two address spaces with small, scoped changes.
+A companion RFC ([secondary-memory-m1-implementation.md](secondary-memory-m1-implementation.md)) covers **M1**: a functional emulation of that hierarchy using two CPU memory pools as stand-ins for the secondary fast memory system and the slow DRAM on host. M1 proves the Simple KV-offload connector can manage two address spaces with small, scoped changes.
 
 > **Terminology**: This document uses neutral hardware-agnostic names — **secondary fast memory** for the novel middle tier and **accelerator** for any device that owns HBM. See [secondary-memory-system-overview.md §Terminology](secondary-memory-system-overview.md#terminology).
 

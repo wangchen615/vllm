@@ -43,7 +43,7 @@ vLLM's existing offload connectors all implement one specific placement policy: 
 
 **M1 implements `partitioned` only.** Admission is keyed on `Request.priority` (vLLM already plumbs this through `LLMEngine.add_request` and `AsyncLLM.add_request` — no API change needed). A configurable threshold `priority_threshold` decides which tier a request's blocks land in. Each tier evicts independently using its own `BlockPool`'s LRU; **no fast→slow demotion path exists**.
 
-The companion [resiliency RFC](hillock-vmem-resiliency.md) owns the design for `hybrid` and `replicate`.
+The companion [resiliency RFC](secondary-memory-resiliency.md) owns the design for `hybrid` and `replicate`.
 
 ### Use cases driving the design
 
@@ -63,7 +63,7 @@ We considered vLLM's three existing offloading connectors before deciding to for
 
 Demonstrate that `SimpleCPUOffloadConnector` can manage **two CPU pools as two distinct address spaces** under a `partitioned` placement policy keyed on `Request.priority`. Pool #0 is the emulated **secondary fast memory system** (code: "fast"), pool #1 is the emulated **slow DRAM on host** (code: "slow"). Both are pinned DRAM; asymmetric performance is deliberately out of scope — M1 measures *functional correctness* (blocks routed to the correct tier by priority, each tier evicts independently, no inter-tier copies, metadata + completion wiring works end-to-end), not throughput.
 
-What's explicitly not being claimed for M1: capacity additivity (the tiers cache different sets of blocks, so capacity isn't simply additive across requests), prefix-miss speedup, resiliency, or model sharing. Those follow from a real secondary fast memory backing and/or from `hybrid` / `replicate` placement modes — covered in the [resiliency RFC](hillock-vmem-resiliency.md).
+What's explicitly not being claimed for M1: capacity additivity (the tiers cache different sets of blocks, so capacity isn't simply additive across requests), prefix-miss speedup, resiliency, or model sharing. Those follow from a real secondary fast memory backing and/or from `hybrid` / `replicate` placement modes — covered in the [resiliency RFC](secondary-memory-resiliency.md).
 
 ### Design committed for M1
 
@@ -152,8 +152,8 @@ Scheduler holds `self._fast: CpuTier | None` and `self._slow: CpuTier | None`. W
 
 - **Inclusive cascade (the existing-connector behavior)**: M1 does not implement fast→slow demotion on eviction. That's deliberate — cascade is what the existing connectors already do, and the project's novelty is precisely *not* doing that. If a deployment wants cascade, the existing `SimpleCPUOffloadConnector` already does it.
 - **Asymmetric performance between the two pools** — M1 is a functional emulation; both pools are pinned DRAM. Real secondary fast memory backings (NUMA-local, CXL-attached, near-accelerator vmem, NVMe, etc.) are follow-up work.
-- **Placement modes other than `partitioned`** — `hybrid` and `replicate` are described in the [resiliency RFC](hillock-vmem-resiliency.md). M1's config surface is shaped so adding a `placement_mode` knob later does not break existing configs.
-- **Resiliency (hot-failure detection & failover)** — see [resiliency RFC](hillock-vmem-resiliency.md); M1 implements none of it.
+- **Placement modes other than `partitioned`** — `hybrid` and `replicate` are described in the [resiliency RFC](secondary-memory-resiliency.md). M1's config surface is shaped so adding a `placement_mode` knob later does not break existing configs.
+- **Resiliency (hot-failure detection & failover)** — see [resiliency RFC](secondary-memory-resiliency.md); M1 implements none of it.
 - **Model sharing with read-only / externally-managed tiers** — the variant of `replicate` covering use case 3 above. Not in M1; M1's `CpuTier` abstraction does not foreclose it.
 - **Sophisticated admission policies** — M1 only routes by `Request.priority` against a single threshold. Reuse-frequency-based, request-size-based, or learned admission policies are out of scope. The `_choose_tier` helper is a clear seam for swapping these in.
 - **Promotion on slow-tier load hit** — partitioned design has no need for promotion (a request's blocks live where it was admitted).
@@ -162,7 +162,7 @@ Scheduler holds `self._fast: CpuTier | None` and `self._slow: CpuTier | None`. W
 
 ## Relationship to the resiliency proposal
 
-A companion RFC, [hillock-vmem-resiliency.md](hillock-vmem-resiliency.md), owns the design for `hybrid` and `replicate` modes plus the failure-detection / failover / re-replication mechanisms. It is **not** scheduled for M1.
+A companion RFC, [secondary-memory-resiliency.md](secondary-memory-resiliency.md), owns the design for `hybrid` and `replicate` modes plus the failure-detection / failover / re-replication mechanisms. It is **not** scheduled for M1.
 
 What M1 must *not* foreclose so the resiliency proposal remains cheap to land later:
 
@@ -237,11 +237,11 @@ Expected: logs show `SimpleCPUOffloadConnector: fast=64.00 MB slow=256.00 MB thr
 
 - Work on branch `dev` (already created off synced upstream `main`).
 - Single focused PR into your fork's `dev` once M1 lands green. Not upstream yet — upstream will want the broader design discussion first.
-- Label issues/PRs with `project:hillock-vmem`.
+- Label issues/PRs with `project:secondary-memory`.
 
 ## Suggested issue breakdown (for project board)
 
-These map 1:1 to the task list tracked during planning. Each can become a GitHub issue under `project:hillock-vmem`. Checkboxes indicate suggested dependency order (top-down).
+These map 1:1 to the task list tracked during planning. Each can become a GitHub issue under `project:secondary-memory`. Checkboxes indicate suggested dependency order (top-down).
 
 - [ ] **[Prep] Verify dev environment + test paths** — confirm `.venv` setup, find existing `tests/v1/simple_kv_offload/`. Confirm `Request.priority` is reachable from the connector's scheduler-side hook.
 - [ ] **[Connector] Parse `fast_cpu_bytes` / `slow_cpu_bytes` / `priority_threshold` config** — three new config fields; backward-compat for legacy `cpu_bytes_to_use` (→ `slow_cpu_bytes` with `fast_cpu_bytes=0`).

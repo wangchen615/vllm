@@ -7,10 +7,10 @@
 | **Owner** | @wangchen615 |
 | **Created** | 2026-05-20 |
 | **Implements** | `placement_mode = "partitioned"` for M1 |
-| **Companion** | [hillock-vmem-two-tier-offload.md](hillock-vmem-two-tier-offload.md) (M1 implementation plan) |
+| **Companion** | [secondary-memory-m1-implementation.md](secondary-memory-m1-implementation.md) (M1 implementation plan) |
 | **Parent** | [secondary-memory-system-overview.md](secondary-memory-system-overview.md) |
 
-This document is the **component-level design** for the M1 placement model. The M1 implementation plan ([hillock-vmem-two-tier-offload.md](hillock-vmem-two-tier-offload.md)) gives the file-by-file edit list; this document gives the *behavior* — how the scheduler, worker, metadata, and tier abstraction interact.
+This document is the **component-level design** for the M1 placement model. The M1 implementation plan ([secondary-memory-m1-implementation.md](secondary-memory-m1-implementation.md)) gives the file-by-file edit list; this document gives the *behavior* — how the scheduler, worker, metadata, and tier abstraction interact.
 
 > **Naming**: "exclusive tiered caching" and the M1 config token `placement_mode = "partitioned"` refer to the same model. The user-facing prose in the RFC family uses **exclusive tiered**; the config string keeps the token `partitioned` so the M1 implementation does not need to rename a knob.
 
@@ -97,11 +97,11 @@ Each store event the scheduler emits goes through the lifecycle shown below.
 
 Source: [`imgs/mmd/store-event-state.mmd`](imgs/mmd/store-event-state.mmd).
 
-M1 implements the green path only: `Pending → InFlight → Completed → Reported`. The `Failed → Quarantined` branch is referenced from the [resiliency RFC](hillock-vmem-resiliency.md); M1's worker does not detect failed copies — a `torch.Event` either completes or the process dies.
+M1 implements the green path only: `Pending → InFlight → Completed → Reported`. The `Failed → Quarantined` branch is referenced from the [resiliency RFC](secondary-memory-resiliency.md); M1's worker does not detect failed copies — a `torch.Event` either completes or the process dies.
 
 ## 6. Configuration surface
 
-This is the user-visible knobs the M1 connector exposes. See [hillock-vmem-two-tier-offload.md §Design committed for M1](hillock-vmem-two-tier-offload.md) for the precise defaults and the legacy-key alias.
+This is the user-visible knobs the M1 connector exposes. See [secondary-memory-m1-implementation.md §Design committed for M1](secondary-memory-m1-implementation.md) for the precise defaults and the legacy-key alias.
 
 | Key | Type | Effect |
 | --- | --- | --- |
@@ -122,6 +122,6 @@ This is the user-visible knobs the M1 connector exposes. See [hillock-vmem-two-t
 ## 8. What this RFC does not cover
 
 - **Heat tracking and reuse-driven placement** — see [inclusive hierarchical](inclusive-hierarchical-caching.md). M1 is priority-driven, not reuse-driven.
-- **Cross-tier failover** — see [resiliency RFC](hillock-vmem-resiliency.md). When the fast tier fails in exclusive tiered mode, M1's behavior is "those requests re-prefill"; the resiliency RFC formalizes detection / quarantine / re-route.
+- **Cross-tier failover** — see [resiliency RFC](secondary-memory-resiliency.md). When the fast tier fails in exclusive tiered mode, M1's behavior is "those requests re-prefill"; the resiliency RFC formalizes detection / quarantine / re-route.
 - **Non-priority admission signals** (model id, request size, prompt length) — orthogonal to M1; can be added at `_choose_tier(request)` later without changing any tier-side data structure.
 - **Real secondary-memory backing** — the M1 emulator uses pinned host DRAM for both pools. Switching pool #0 to a real backing is a worker-only change.

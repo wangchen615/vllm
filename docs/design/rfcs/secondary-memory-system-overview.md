@@ -6,7 +6,7 @@
 | **Branch** | `dev` |
 | **Owner** | @wangchen615 |
 | **Created** | 2026-05-20 |
-| **Related** | [Exclusive tiered caching (M1)](exclusive-tiered-caching.md), [Inclusive hierarchical caching (future)](inclusive-hierarchical-caching.md), [Resiliency](hillock-vmem-resiliency.md) |
+| **Related** | [Exclusive tiered caching (M1)](exclusive-tiered-caching.md), [Inclusive hierarchical caching (future)](inclusive-hierarchical-caching.md), [Resiliency](secondary-memory-resiliency.md) |
 
 This document describes the **production hardware target** for a three-level KV-cache memory hierarchy and the **vLLM emulator** that lets us iterate on placement, resiliency, and observability without that hardware in hand.
 
@@ -15,7 +15,7 @@ It is the entry point to a small family of sibling RFCs:
 - This doc — system + emulator overview.
 - [Exclusive tiered caching](exclusive-tiered-caching.md) — the M1 placement model (partitioned by request priority).
 - [Inclusive hierarchical caching](inclusive-hierarchical-caching.md) — future-work placement model (HBM eviction cascade with promote/demote between two CPU pools).
-- [Resiliency](hillock-vmem-resiliency.md) — failure semantics and recovery across the hierarchy.
+- [Resiliency](secondary-memory-resiliency.md) — failure semantics and recovery across the hierarchy.
 
 ## Terminology
 
@@ -37,7 +37,7 @@ Source: [`imgs/mmd/system-overview.mmd`](imgs/mmd/system-overview.mmd) — edit 
 A conventional vLLM offload connector sees one CPU pool. Two things change in the production target:
 
 1. There are now **two address spaces below HBM**, with very different latency / bandwidth profiles. The secondary fast memory tier is reachable from the accelerator without crossing the host-DRAM path; the slow tier is normal pinned host DRAM.
-2. The **placement policy** between those two address spaces is a first-class design choice — not just "evict from fast, demote to slow." Three placement modes are anticipated in the RFC family: `partitioned` (M1, [exclusive tiered](exclusive-tiered-caching.md)), `hybrid` and `replicate` ([resiliency RFC](hillock-vmem-resiliency.md)), and a separate `inclusive hierarchical` mode ([future](inclusive-hierarchical-caching.md)). Each one decides differently which tier holds which block and whether a block can live in more than one tier.
+2. The **placement policy** between those two address spaces is a first-class design choice — not just "evict from fast, demote to slow." Three placement modes are anticipated in the RFC family: `partitioned` (M1, [exclusive tiered](exclusive-tiered-caching.md)), `hybrid` and `replicate` ([resiliency RFC](secondary-memory-resiliency.md)), and a separate `inclusive hierarchical` mode ([future](inclusive-hierarchical-caching.md)). Each one decides differently which tier holds which block and whether a block can live in more than one tier.
 
 The combination of two physical address spaces *and* a real placement-policy choice is what motivates a new design rather than a small extension to an existing connector.
 
@@ -65,11 +65,11 @@ What it explicitly does **not** prove (and is not expected to) — capacity addi
    secondary-memory-system-overview.md   ← this doc
         ├── exclusive-tiered-caching.md         ← M1 placement (partitioned)
         ├── inclusive-hierarchical-caching.md   ← future placement (cascade)
-        └── hillock-vmem-resiliency.md          ← failure model & recovery
-                  hillock-vmem-two-tier-offload.md  ← M1 implementation plan
+        └── secondary-memory-resiliency.md          ← failure model & recovery
+                  secondary-memory-m1-implementation.md  ← M1 implementation plan
 ```
 
-- The **M1 implementation plan** ([`hillock-vmem-two-tier-offload.md`](hillock-vmem-two-tier-offload.md)) is the concrete, code-level plan for the partitioned mode. The exclusive-tiered RFC describes the same model at a component-design level (placement, sequence, state, ER, class). Read the component RFC for *what* the system does; read the M1 plan for *which files change*.
+- The **M1 implementation plan** ([`secondary-memory-m1-implementation.md`](secondary-memory-m1-implementation.md)) is the concrete, code-level plan for the partitioned mode. The exclusive-tiered RFC describes the same model at a component-design level (placement, sequence, state, ER, class). Read the component RFC for *what* the system does; read the M1 plan for *which files change*.
 - The **inclusive hierarchical** RFC is design-only — no code is committed for it in M1. It exists so the abstractions in M1 (`CpuTier`, the metadata layout, the worker copy backends) do not silently exclude it.
 - The **resiliency** RFC owns `hybrid` / `replicate` placement modes and the failure-detection / failover / re-replication mechanisms. It is the natural follow-on after M1.
 
@@ -77,5 +77,5 @@ What it explicitly does **not** prove (and is not expected to) — capacity addi
 
 - Concrete capacity sizing for the secondary fast memory tier — workload-dependent, will follow once a real backing is wired up.
 - Real-hardware drivers / kernel changes — outside vLLM.
-- Multi-pod or cross-pod sharing of the secondary fast memory tier — out of scope here; one cross-deployment scenario lives in the [resiliency RFC](hillock-vmem-resiliency.md).
+- Multi-pod or cross-pod sharing of the secondary fast memory tier — out of scope here; one cross-deployment scenario lives in the [resiliency RFC](secondary-memory-resiliency.md).
 - Observability / metrics — to be added per-tier after the functional milestone lands.

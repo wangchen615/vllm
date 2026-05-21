@@ -8,7 +8,7 @@
 | **Created** | 2026-05-20 |
 | **Implements** | `placement_mode = "inclusive"` (proposed token) |
 | **Parent** | [secondary-memory-system-overview.md](secondary-memory-system-overview.md) |
-| **Sibling** | [exclusive-tiered-caching.md](exclusive-tiered-caching.md) (the M1 mode), [hillock-vmem-resiliency.md](hillock-vmem-resiliency.md) |
+| **Sibling** | [exclusive-tiered-caching.md](exclusive-tiered-caching.md) (the M1 mode), [secondary-memory-resiliency.md](secondary-memory-resiliency.md) |
 
 This document specifies a **second placement model** for the secondary-memory hierarchy: an **inclusive cascade** between the two CPU tiers, with explicit promote and demote paths. It is **not** scheduled for M1 — the M1 RFC ([exclusive-tiered-caching.md](exclusive-tiered-caching.md)) commits to the partitioned/exclusive model only. This RFC exists so that M1's abstractions are sized correctly to admit this mode later without invasive refactors.
 
@@ -34,7 +34,7 @@ Source: [`imgs/mmd/inclusive-hierarchical-placement.mmd`](imgs/mmd/inclusive-hie
 
 ### Why these invariants
 
-The superset invariant gives a simple resiliency story (covered in [resiliency RFC §prefetch](hillock-vmem-resiliency.md)): if the fast tier fails, **every block can still be served from slow**. No re-prefill is needed. This is the resiliency mechanism that the partitioned mode does not have.
+The superset invariant gives a simple resiliency story (covered in [resiliency RFC §prefetch](secondary-memory-resiliency.md)): if the fast tier fails, **every block can still be served from slow**. No re-prefill is needed. This is the resiliency mechanism that the partitioned mode does not have.
 
 ## 2. End-to-end flow
 
@@ -103,13 +103,13 @@ See [`imgs/mmd/block-tier-er.mmd`](imgs/mmd/block-tier-er.mmd) (rendered in the 
 1. **It needs heat tracking.** A reuse counter (with decay) is a non-trivial new piece of state in the scheduler. M1 deliberately avoids adding it because exclusive tiered does not need it.
 2. **It needs a host↔host copy backend.** M1 does not — exclusive tiered never copies between tiers. Adding the backend (and its event lifecycle, completion accounting, error handling) is a meaningful chunk of work.
 3. **The placement decision is more entangled with eviction.** In exclusive mode, admission is decided once and never revisited. In inclusive mode, every fast-tier eviction is also a placement decision (demote vs drop). That entanglement is the main reason a separate RFC is warranted.
-4. **The resiliency story is different.** Inclusive mode's recovery from a fast-tier failure is **prefetch from slow** ([resiliency RFC](hillock-vmem-resiliency.md)), not recompute. The two failure paths share the same `TierHealth` machinery but trigger different recovery actions.
+4. **The resiliency story is different.** Inclusive mode's recovery from a fast-tier failure is **prefetch from slow** ([resiliency RFC](secondary-memory-resiliency.md)), not recompute. The two failure paths share the same `TierHealth` machinery but trigger different recovery actions.
 
 ## 7. What this RFC does not commit to
 
 - An implementation timeline. This document is design-only.
 - A specific heat-counter encoding (saturating uint8 vs. exponential decay vs. count-min). The choice is a tunable; the **existence** of the counter is what the design depends on.
-- Interaction with `hybrid` / `replicate` placement modes. Those live in the [resiliency RFC](hillock-vmem-resiliency.md). Combining inclusive cascade with replication would be a fourth mode and is out of scope here.
+- Interaction with `hybrid` / `replicate` placement modes. Those live in the [resiliency RFC](secondary-memory-resiliency.md). Combining inclusive cascade with replication would be a fourth mode and is out of scope here.
 
 ## 8. Relationship to existing vLLM connectors
 
