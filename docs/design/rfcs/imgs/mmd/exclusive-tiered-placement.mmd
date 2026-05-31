@@ -1,18 +1,27 @@
-%% Exclusive tiered caching: high-priority requests' KV blocks live in the
-%% emulated secondary fast memory; lower-priority blocks live in CPU DRAM.
-%% Heat indicates reuse rate (not used as a placement signal in M1 — only
-%% priority is). See docs/design/rfcs/exclusive-tiered-caching.md
-flowchart TB
-    HBM["HBM<br/>(GPU KV cache)"]:::hbm
+%% Exclusive tiered placement (partitioned mode):
+%% high-priority requests' blocks land in FAST_CPU, lower-priority in SLOW_CPU,
+%% no inter-medium movement. Both media are views of one shared host pool.
+%% See docs/design/rfcs/exclusive-tiered-caching.md
+flowchart LR
+    subgraph Requests["Incoming requests"]
+        ReqHi["Request<br/>priority=0<br/>(default = high)"]
+        ReqLo["Request<br/>priority=5<br/>(de-prioritized)"]
+    end
 
-    Fast["Secondary fast memory pool<br/>holds high-priority requests' KV blocks"]:::fast
-    Slow["Slow host DRAM pool<br/>holds lower-priority requests' KV blocks"]:::slow
+    Admission["AdmissionPolicy<br/>(PriorityAdmissionPolicy)<br/>priority < threshold ?"]
 
-    HBM ===|"high-priority<br/>store / load"| Fast
-    HBM ===|"low-priority<br/>store / load"| Slow
+    subgraph Pool["Shared host memory pool (HMPM-owned)"]
+        direction TB
+        FastMed["FAST_CPU medium<br/>blocks for hi-priority work"]:::fast
+        SlowMed["SLOW_CPU medium<br/>blocks for lo-priority work"]:::slow
+    end
 
-    Fast <--->|"no inter-tier movement<br/>(blocks never demoted/promoted)"| Slow
+    ReqHi --> Admission
+    ReqLo --> Admission
+    Admission -- "yes" --> FastMed
+    Admission -- "no" --> SlowMed
 
-    classDef hbm fill:#fff3e6,stroke:#cc6600,stroke-width:2px
-    classDef fast fill:#e8f5e0,stroke:#3a8a1a,stroke-width:2px
-    classDef slow fill:#e6f0ff,stroke:#1a4d99,stroke-width:2px
+    FastMed -. "no demote / no promote<br/>(separate populations)" .- SlowMed
+
+    classDef fast fill:#ffe6cc,stroke:#d79b00
+    classDef slow fill:#dae8fc,stroke:#6c8ebf

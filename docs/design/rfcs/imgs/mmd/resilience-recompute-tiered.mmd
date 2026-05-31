@@ -1,18 +1,24 @@
-%% Resilience scenario 2 (exclusive tiered): when the secondary fast
-%% memory pool fails, requests whose KV blocks lived only there must
-%% re-prefill on the accelerator. Slow-pool requests are unaffected.
+%% Scenario B (resiliency RFC): under partitioned mode, FAST_CPU failure
+%% forces high-priority requests to re-prefill on the accelerator.
+%% SLOW_CPU requests are unaffected.
+%% See docs/design/rfcs/secondary-memory-resiliency.md §Use case 1
 flowchart LR
-    Acc["Accelerator"]
-    HBM["HBM"]
-    Acc --- HBM
+    HBM["Accelerator HBM"]
 
-    SecMem["Secondary fast memory pool<br/>(unresponsive)"]:::dead
-    Slow["Slow host DRAM pool<br/>(healthy)"]:::ok
+    subgraph Pool["Shared host pool"]
+        Fast["FAST_CPU<br/>UNRESPONSIVE"]:::failed
+        Slow["SLOW_CPU<br/>healthy"]:::slow
+    end
 
-    HBM x--x|"high-priority blocks<br/>were exclusively here"| SecMem
-    HBM <-->|low-priority blocks<br/>continue normally| Slow
+    ReqHi["High-priority requests<br/>(blocks WERE in FAST_CPU)"]:::hi
+    ReqLo["Low-priority requests<br/>(blocks in SLOW_CPU)"]:::lo
 
-    HBM ==>|"recompute (re-prefill)<br/>requests whose KV<br/>was in the dead tier"| HBM
+    ReqHi -. "miss → recompute (re-prefill)" .-> HBM
+    HBM -.->|attempt load fails| Fast
+    ReqLo --> HBM
+    HBM <--> Slow
 
-    classDef dead fill:#fee,stroke:#c00,stroke-dasharray:5 5
-    classDef ok fill:#e8f5e0,stroke:#3a8a1a
+    classDef failed fill:#f8cecc,stroke:#b85450
+    classDef slow fill:#dae8fc,stroke:#6c8ebf
+    classDef hi fill:#ffe6cc,stroke:#d79b00
+    classDef lo fill:#dae8fc,stroke:#6c8ebf

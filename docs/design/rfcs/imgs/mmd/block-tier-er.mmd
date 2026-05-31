@@ -1,36 +1,47 @@
-%% Entity-relationship diagram: how a logical KV block hash relates to
-%% physical block IDs across tiers, and to the metadata that tracks them.
+%% ER diagram: how an OffloadKey relates to physical blocks across media,
+%% deployments, and requests, mediated by the HMPM allocation table.
+%% Cardinality "OFFLOAD_KEY ||--o{ MEDIUM_RESIDENCE" means N=1 in partitioned (M1)
+%% per deployment; N>=1 across deployments and in inclusive/replicate modes.
+%% See docs/design/rfcs/exclusive-tiered-caching.md
 erDiagram
-    BLOCK_HASH ||--o{ TIER_RESIDENCE : "lives in N tiers (N=1 exclusive, N≥1 inclusive)"
-    TIER_RESIDENCE }o--|| TIER : "is a slot in"
-    TIER ||--|| BLOCK_POOL : "owned by"
-    BLOCK_POOL ||--o{ PHYSICAL_BLOCK : "manages"
-    TIER_RESIDENCE }|--|| PHYSICAL_BLOCK : "occupies one"
+    REQUEST ||--o{ OFFLOAD_KEY : "produces / consumes"
+    OFFLOAD_KEY ||--o{ MEDIUM_RESIDENCE : "lives in N media"
+    DEPLOYMENT ||--o{ MEDIUM_RESIDENCE : "owns"
+    MEDIUM ||--o{ MEDIUM_RESIDENCE : "categorizes"
+    MEDIUM_RESIDENCE ||--|| PHYSICAL_BLOCK : "occupies"
+    HMPM_POOL ||--o{ PHYSICAL_BLOCK : "contains"
+    HMPM_POOL ||--o{ MEDIUM : "surfaces"
 
-    REQUEST ||--o{ BLOCK_HASH : "produces / consumes"
     REQUEST {
+        string request_id
         int priority
-        string req_id
     }
-
-    BLOCK_HASH {
-        bytes hash
-        int group_id
+    OFFLOAD_KEY {
+        bytes block_hash
+        int group_idx
     }
-
-    TIER {
-        int tier_id
+    DEPLOYMENT {
+        string deployment_id
+        timestamp last_heartbeat
+        string status
+    }
+    MEDIUM_RESIDENCE {
+        bytes offload_key_FK
+        string deployment_id_FK
+        string medium
+        int physical_block_id
+    }
+    MEDIUM {
+        string medium_name
+        int num_blocks
         bool writable
         bool externally_managed
     }
-
-    TIER_RESIDENCE {
-        int physical_block_id
-        int tier_id
-        int ref_count
-    }
-
     PHYSICAL_BLOCK {
         int block_id
-        int tier_id
+        int byte_offset
+    }
+    HMPM_POOL {
+        string mmap_path
+        int total_bytes
     }

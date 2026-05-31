@@ -1,11 +1,15 @@
-%% State machine: lifecycle of a store event from issuance to completion.
+%% State machine: OffloadingEvent (medium-tagged) lifecycle.
+%% Green path is M1; Failed/Quarantined branch is the resiliency RFC.
+%% See docs/design/rfcs/exclusive-tiered-caching.md
 stateDiagram-v2
-    [*] --> Pending : scheduler emits store_event_idx
-    Pending --> InFlight : worker dequeues and launch_copy
-    InFlight --> Completed : torch.Event done and hash inserted into tier cache
-    Completed --> Reported : worker reports via SimpleCPUOffloadWorkerMetadata
-    Reported --> [*] : scheduler accumulates across world_size and frees pending refs
+    [*] --> Pending : prepare_store returns
+    Pending --> InFlight : worker.start_transfer
+    InFlight --> Completed : torch.Event ready
+    Completed --> Reported : take_events drained
+    Reported --> [*]
 
-    InFlight --> Failed : resiliency RFC - timeout or DMA error
-    Failed --> Quarantined : tier health goes suspect to quarantined
-    Quarantined --> [*]
+    InFlight --> Failed : timeout / error<br/>(resiliency RFC only)
+    Failed --> Quarantined : N consecutive failures<br/>(resiliency RFC only)
+    Quarantined --> [*] : medium re-enabled
+
+    note right of Reported : OffloadingEvent.medium tags the<br/>destination (FAST_CPU or SLOW_CPU);<br/>per-medium counters fall out for free.

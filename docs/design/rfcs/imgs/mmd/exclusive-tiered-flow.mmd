@@ -1,32 +1,42 @@
-%% Exclusive tiered store/load workflow.
+%% Sequence: scheduler calls MultiMediaOffloadingManager.prepare_store;
+%% manager admits to FAST_CPU or SLOW_CPU based on req_context.priority;
+%% worker dispatches by (src_type, dst_type) yielded from get_handlers().
+%% See docs/design/rfcs/exclusive-tiered-caching.md
 sequenceDiagram
     autonumber
-    participant Client
-    participant Sched as Scheduler<br/>(SimpleCPUOffloadScheduler)
-    participant Fast as Fast tier<br/>(BlockPool #0)
-    participant Slow as Slow tier<br/>(BlockPool #1)
-    participant Worker as Worker<br/>(SimpleCPUOffloadWorker)
+    participant Sched as OffloadingConnectorScheduler
+    participant MM as MultiMediaOffloadingManager
+    participant Pol as PriorityAdmissionPolicy
+    participant Fast as Fast CPUOffloadingManager
+    participant Slow as Slow CPUOffloadingManager
+    participant Worker as OffloadingConnectorWorker
+    participant FH as Fast CpuGpuHandlers
+    participant SH as Slow CpuGpuHandlers
 
-    Client->>Sched: add_request(priority=p)
-    Sched->>Sched: tier := _choose_tier(p)<br/>(p < threshold ⇒ fast, else slow)
+    Note over Sched,SH: Store path — admission once per request
+    Sched->>MM: prepare_store(keys, ReqContext(priority=0))
+    MM->>Pol: choose(req_context)
+    Pol-->>MM: Fast manager
+    MM->>Fast: prepare_store(keys, req_context)
+    Fast-->>MM: PrepareStoreOutput(spec=FastCpuLoadStoreSpec, ...)
+    MM-->>Sched: PrepareStoreOutput
+    Sched->>Worker: build_connector_meta with FastCpuLoadStoreSpec
+    Worker->>FH: gpu_to_cpu_handler.start_transfer(...)
+    FH-->>Worker: torch.Event
+    Worker->>MM: complete_store(keys, success=True)
 
-    rect rgba(232,245,224,0.5)
-        note over Sched,Worker: Store path (KV produced on GPU)
-        Sched->>Sched: _prepare_eager_store_specs<br/>(emit one event per tier this step)
-        Sched-->>Worker: SimpleCPUOffloadMetadata<br/>(store_cpu_tier=tier, store_blocks=…)
-        Worker->>Fast: launch_copy(GPU→Fast)<br/>iff tier==fast
-        Worker->>Slow: launch_copy(GPU→Slow)<br/>iff tier==slow
-        Worker-->>Sched: completed_store_events
+    Note over Sched,SH: Load path — fast first, then slow, longer prefix wins
+    Sched->>MM: lookup(key, req_context)
+    MM->>Fast: lookup(key)
+    Fast-->>MM: True/False
+    alt fast missed
+        MM->>Slow: lookup(key)
+        Slow-->>MM: True/False
     end
-
-    rect rgba(230,240,255,0.5)
-        note over Sched,Worker: Load path (cache hit on prefix)
-        Sched->>Fast: find_longest_cache_hit
-        Sched->>Slow: find_longest_cache_hit
-        Sched->>Sched: pick longer hit, record cpu_tier per block
-        Sched-->>Worker: SimpleCPUOffloadMetadata<br/>(load_blocks=…, load_cpu_tiers=[…])
-        Worker->>Fast: launch_copy(Fast→GPU)<br/>for tier-0 blocks
-        Worker->>Slow: launch_copy(Slow→GPU)<br/>for tier-1 blocks
-    end
-
-    note over Fast,Slow: Each tier evicts independently using its own LRU.<br/>No demote / promote / cascade between tiers.
+    MM-->>Sched: True/False/None
+    Sched->>MM: prepare_load(keys, req_context)
+    MM->>Slow: prepare_load(keys)
+    Slow-->>MM: SlowCpuLoadStoreSpec(...)
+    MM-->>Sched: SlowCpuLoadStoreSpec(...)
+    Sched->>Worker: dispatch by (Slow → GPU)
+    Worker->>SH: cpu_to_gpu_handler.start_transfer(...)

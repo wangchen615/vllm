@@ -1,59 +1,95 @@
-%% Class diagram: the CpuTier abstraction and how it relates to existing
-%% vLLM types (KVCacheCoordinator, BlockPool, DmaCopyBackend).
+%% Class diagram: MultiMediaOffloadingManager + AdmissionPolicy +
+%% SecondaryMemoryOffloadingSpec on top of OffloadingConnector primitives;
+%% HostMemoryPoolManager + HmpmClient sit underneath as the shared substrate.
+%% Filename kept for diff continuity; contents reflect the OffloadingConnector-based design.
+%% See docs/design/rfcs/exclusive-tiered-caching.md
 classDiagram
-    class CpuTier {
-        +int tier_id
+    class SecondaryMemoryOffloadingSpec {
+        +int fast_blocks
+        +int slow_blocks
+        +int priority_threshold
+        +str eviction_policy
+        +bool hmpm_enabled
+        +str placement_mode
+        +get_manager() OffloadingManager
+        +get_handlers() Iterator
+    }
+
+    class MultiMediaOffloadingManager {
+        -OffloadingManager _fast
+        -OffloadingManager _slow
+        -AdmissionPolicy _admission
+        -dict _owns
+        +lookup(key, ctx) bool|None
+        +prepare_load(keys, ctx) LoadStoreSpec
+        +prepare_store(keys, ctx) PrepareStoreOutput
+        +complete_store(keys, success) None
+        +absorb_claimed_keys(keys, medium) None
+    }
+
+    class AdmissionPolicy {
+        <<Protocol>>
+        +choose(req_context) OffloadingManager
+    }
+
+    class PriorityAdmissionPolicy {
+        +int threshold
+        +choose(req_context) OffloadingManager
+    }
+
+    class CPUOffloadingManager {
         +int num_blocks
-        +KVCacheCoordinator coordinator
-        +BlockPool block_pool
-        +Tensor[] cpu_caches
-        +DmaCopyBackend dma
-        +TierHealth health  ⟵ resiliency RFC
-        +bool writable      ⟵ resiliency RFC
-        +bool externally_managed  ⟵ resiliency RFC
+        +CachePolicy policy
+        +medium: str
+        +lookup(key, ctx) bool|None
+        +prepare_store(keys, ctx) PrepareStoreOutput
+        +complete_store(keys, success) None
+        +take_events() Iterable
     }
 
-    class SimpleCPUOffloadScheduler {
-        -CpuTier _fast
-        -CpuTier _slow
-        +_choose_tier(request) CpuTier
-        +get_num_new_matched_tokens(request) int
-        +update_state_after_alloc(request) None
-        +build_connector_meta() SimpleCPUOffloadMetadata
+    class CachePolicy {
+        <<abstract>>
+        +get(key)
+        +touch(keys)
+        +insert(key, block)
+        +evict(n, protected)
     }
 
-    class SimpleCPUOffloadWorker {
-        -CpuTier _fast
-        -CpuTier _slow
-        +register_kv_caches(gpu_caches) None
-        +start_load_kv(meta) None
-        +wait_for_save() None
-        +get_finished() (loaded, stored)
+    class HmpmClient {
+        +attach(deployment_id) AttachHandle
+        +allocate(handle, medium, keys) AllocateResponse
+        +free(handle, medium, ids) None
+        +lookup_peer(handle, keys) list~PeerHit~
+        +claim_orphan(handle, peer_id, keys) ClaimResponse
+        +heartbeat() None
     }
 
-    class KVCacheCoordinator {
-        +find_longest_cache_hit(...)
-        +allocate_slots(...)
-        +free(...)
+    class HostMemoryPoolManager {
+        +mmap region: bytes
+        +allocation_table: dict
+        +heartbeats: dict
+        +on_attach(...) AttachHandle
+        +on_allocate(...) AllocateResponse
+        +on_lookup_peer(...) list~PeerHit~
+        +on_claim_orphan(...) ClaimResponse
     }
 
-    class BlockPool {
-        +int num_gpu_blocks
-        +cached_block_hash_to_block
-        +free_block_queue
-        +get_num_free_blocks() int
+    class HmpmSharedOffloadRegion {
+        +HmpmClient client
+        +str medium
+        +int num_blocks
+        +create_next_view(page_size) Tensor
+        +cleanup() None
     }
 
-    class DmaCopyBackend {
-        +init(gpu_caches, cpu_caches, ...)
-        +launch_copy(src, dst, is_store, ...)
-        +shutdown()
-    }
+    SecondaryMemoryOffloadingSpec --> MultiMediaOffloadingManager : creates
+    MultiMediaOffloadingManager --> CPUOffloadingManager : wraps 2
+    MultiMediaOffloadingManager --> AdmissionPolicy : delegates admission
+    PriorityAdmissionPolicy ..|> AdmissionPolicy
+    CPUOffloadingManager --> CachePolicy : owns
+    SecondaryMemoryOffloadingSpec --> HmpmClient : uses if hmpm_enabled
+    HmpmClient ..> HostMemoryPoolManager : RPC over UDS
+    SecondaryMemoryOffloadingSpec --> HmpmSharedOffloadRegion : drops in for SharedOffloadRegion
+    HmpmSharedOffloadRegion --> HmpmClient : reads pool slice
 
-    SimpleCPUOffloadScheduler --> CpuTier : holds 1..2
-    SimpleCPUOffloadWorker --> CpuTier : holds 1..2
-    CpuTier --> KVCacheCoordinator : owns
-    CpuTier --> BlockPool : owns
-    CpuTier --> DmaCopyBackend : owns
-
-    note for CpuTier "Symmetric abstraction.<br/>No 'fast'-vs-'slow' asymmetry leaks<br/>into code paths — required so future<br/>placement modes (replicate, hybrid)<br/>can flip behavior without invasive change."
+    note for MultiMediaOffloadingManager "Symmetric — no 'fast'-vs-'slow' asymmetry<br/>leaks anywhere except AdmissionPolicy.<br/>Replaced by InclusiveCascadeManager,<br/>HybridReplicateManager, ReplicateManager<br/>per placement_mode in resiliency RFC."

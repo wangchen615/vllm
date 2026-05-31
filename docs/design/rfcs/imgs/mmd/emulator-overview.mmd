@@ -1,19 +1,41 @@
-%% Emulator overview: how vLLM's SimpleCPUOffloadConnector emulates the
-%% three-level hierarchy with two CPU memory pools.
+%% Emulator overview: one mmap-backed shared host pool, surfaced to vLLM as
+%% FAST_CPU and SLOW_CPU media; HMPM owns the pool; multiple vLLM instances attach.
 %% See docs/design/rfcs/secondary-memory-system-overview.md
-flowchart TB
-    Acc["Accelerator (e.g. GPU/NPU)"]
-    HBM["HBM<br/>(GPU KV cache)"]
-    Acc --- HBM
-
-    subgraph Emu["Emulation: two pinned-host CPU pools (M1)"]
-        Fast["Pool #0: emulated<br/>secondary fast memory<br/>(pinned host DRAM,<br/>small)"]
-        Slow["Pool #1: emulated<br/>slow host DRAM<br/>(pinned host DRAM,<br/>large)"]
-        Fast <--> Slow
+flowchart LR
+    subgraph HMPMService["HMPM (external service)"]
+        direction TB
+        HMPM["HostMemoryPoolManager<br/>service"]
+        SharedPool["mmap region<br/>/dev/shm/hillock_secondary_pool.mmap"]
+        AllocTable["allocation table<br/>(deployment_id, key) → (medium, block_id)"]
+        Heartbeat["heartbeat tracker<br/>(per-deployment liveness)"]
+        HMPM --- SharedPool
+        HMPM --- AllocTable
+        HMPM --- Heartbeat
     end
 
-    HBM <-->|cuMemcpyBatchAsync| Fast
-    HBM <-->|cuMemcpyBatchAsync| Slow
+    subgraph VllmA["vLLM deployment A"]
+        SpecA["SecondaryMemoryOffloadingSpec"]
+        ClientA["HmpmClient"]
+        FastViewA["FAST_CPU view<br/>(slice of pool)"]
+        SlowViewA["SLOW_CPU view<br/>(slice of pool)"]
+        SpecA --> ClientA
+        ClientA --> FastViewA
+        ClientA --> SlowViewA
+    end
 
-    note["Both pools are pinned host DRAM in M1.<br/>No real speed asymmetry — M1 proves<br/>functional management of two address<br/>spaces with small, scoped changes to<br/>SimpleCPUOffloadConnector."]
-    Emu -.- note
+    subgraph VllmB["vLLM deployment B"]
+        SpecB["SecondaryMemoryOffloadingSpec"]
+        ClientB["HmpmClient"]
+        FastViewB["FAST_CPU view"]
+        SlowViewB["SLOW_CPU view"]
+        SpecB --> ClientB
+        ClientB --> FastViewB
+        ClientB --> SlowViewB
+    end
+
+    ClientA <-.->|UDS attach/allocate/<br/>lookup_peer/claim_orphan| HMPM
+    ClientB <-.->|UDS attach/allocate/<br/>lookup_peer/claim_orphan| HMPM
+    FastViewA -. mmap slice .-> SharedPool
+    SlowViewA -. mmap slice .-> SharedPool
+    FastViewB -. mmap slice .-> SharedPool
+    SlowViewB -. mmap slice .-> SharedPool
