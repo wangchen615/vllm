@@ -1,0 +1,22 @@
+%% Scenario C (resiliency RFC): under inclusive mode, SLOW_CPU is a superset of FAST_CPU.
+%% When FAST_CPU fails, every block can be served from SLOW_CPU — no re-prefill.
+%% See docs/design/rfcs/secondary-memory-resiliency.md §Use case 1
+flowchart LR
+    HBM["Accelerator HBM"]
+
+    subgraph Pool["Shared host pool"]
+        Fast["FAST_CPU<br/>UNRESPONSIVE"]:::failed
+        Slow["SLOW_CPU<br/>healthy<br/>(superset of FAST_CPU)"]:::slow
+    end
+
+    Req["All in-flight requests"]
+
+    Req --> HBM
+    HBM -. "load attempt fails" .-> Fast
+    HBM -. "fail-over read<br/>(inclusive: replica_media has SLOW_CPU)" .-> Slow
+    Slow --> HBM
+
+    HBM -.->|"requests resume"| Req
+
+    classDef failed fill:#f8cecc,stroke:#b85450
+    classDef slow fill:#dae8fc,stroke:#6c8ebf

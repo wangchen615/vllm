@@ -1,0 +1,33 @@
+%% Cross-deployment recovery (M1 mechanism).
+%% Two vLLM deployments attached to one HMPM. Deployment A loses HBM.
+%% Deployment B detects A is orphaned, claims A's blocks, prefetches them.
+%% See docs/design/rfcs/exclusive-tiered-caching.md §5
+sequenceDiagram
+    autonumber
+    participant A as vLLM deployment A
+    participant HMPM as Host Memory Pool Manager
+    participant B as vLLM deployment B
+    participant Drv as B's CrossDeploymentRecoveryDriver
+
+    Note over A,B: Steady state — both deployments serving
+    A->>HMPM: heartbeat (1 Hz)
+    B->>HMPM: heartbeat (1 Hz)
+    A->>HMPM: allocate(FAST_CPU, keys=[k1, k2])
+    HMPM-->>A: physical block ids
+    Note over A,HMPM: A stores KV blocks for in-flight requests
+
+    Note over A: A's accelerator dies — heartbeats stop
+    HMPM->>HMPM: heartbeat timeout reached<br/>mark deployment_id=A as orphaned
+
+    Note over B,Drv: External orchestrator notifies B<br/>which request_ids to recover
+    Drv->>B: recover(peer="A", request_ids=[r1])
+    Drv->>B: compute_offload_keys(r1) → [k1, k2]
+    Drv->>HMPM: lookup_peer(keys=[k1, k2])
+    HMPM-->>Drv: PeerHit(k1, FAST_CPU, blk_id), PeerHit(k2, ...)
+    Drv->>HMPM: claim_orphan(peer="A", keys=[k1, k2])
+    HMPM-->>Drv: ownership transferred to B
+    Drv->>B: absorb_claimed_keys(keys, medium="FAST_CPU")
+
+    Note over B: Next prefix-cache lookup hits;<br/>existing load path moves blocks → HBM
+    B->>HMPM: (cpu_to_gpu_handler reads via existing pool slice)
+    Note over B: B resumes A's in-flight requests, no re-prefill

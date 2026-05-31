@@ -1,0 +1,33 @@
+%% System overview: production hardware target for the secondary fast memory tier.
+%% Multiple accelerator deployments share one host pool through the Host Memory Pool Manager.
+%% See docs/design/rfcs/secondary-memory-system-overview.md
+flowchart TB
+    subgraph Host["Host"]
+        HMPM["Host Memory Pool Manager<br/>(external service)"]
+        Pool["Shared host memory pool<br/>(mmap-backed, surfaced as<br/>FAST_CPU and SLOW_CPU media)"]
+        HMPM --- Pool
+    end
+
+    subgraph PodA["Pod A"]
+        direction LR
+        AccA["Accelerator A"]
+        HBM_A["HBM"]
+        AccA --- HBM_A
+    end
+
+    subgraph PodB["Pod B"]
+        direction LR
+        AccB["Accelerator B"]
+        HBM_B["HBM"]
+        AccB --- HBM_B
+    end
+
+    subgraph SecMem["Secondary fast memory system<br/>(PCIe/CXL fabric, larger than HBM,<br/>faster than host DRAM to reach)"]
+        SecPool["Shared secondary pool"]
+    end
+
+    HBM_A <--> SecPool
+    HBM_B <--> SecPool
+    HBM_A <-.->|attach via HMPM| Pool
+    HBM_B <-.->|attach via HMPM| Pool
+    SecPool <--> Pool

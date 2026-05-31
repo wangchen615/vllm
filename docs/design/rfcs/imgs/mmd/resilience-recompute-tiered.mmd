@@ -1,0 +1,24 @@
+%% Scenario B (resiliency RFC): under partitioned mode, FAST_CPU failure
+%% forces high-priority requests to re-prefill on the accelerator.
+%% SLOW_CPU requests are unaffected.
+%% See docs/design/rfcs/secondary-memory-resiliency.md §Use case 1
+flowchart LR
+    HBM["Accelerator HBM"]
+
+    subgraph Pool["Shared host pool"]
+        Fast["FAST_CPU<br/>UNRESPONSIVE"]:::failed
+        Slow["SLOW_CPU<br/>healthy"]:::slow
+    end
+
+    ReqHi["High-priority requests<br/>(blocks WERE in FAST_CPU)"]:::hi
+    ReqLo["Low-priority requests<br/>(blocks in SLOW_CPU)"]:::lo
+
+    ReqHi -. "miss → recompute (re-prefill)" .-> HBM
+    HBM -.->|attempt load fails| Fast
+    ReqLo --> HBM
+    HBM <--> Slow
+
+    classDef failed fill:#f8cecc,stroke:#b85450
+    classDef slow fill:#dae8fc,stroke:#6c8ebf
+    classDef hi fill:#ffe6cc,stroke:#d79b00
+    classDef lo fill:#dae8fc,stroke:#6c8ebf

@@ -1,0 +1,27 @@
+%% Exclusive tiered placement (partitioned mode):
+%% high-priority requests' blocks land in FAST_CPU, lower-priority in SLOW_CPU,
+%% no inter-medium movement. Both media are views of one shared host pool.
+%% See docs/design/rfcs/exclusive-tiered-caching.md
+flowchart LR
+    subgraph Requests["Incoming requests"]
+        ReqHi["Request<br/>priority=0<br/>(default = high)"]
+        ReqLo["Request<br/>priority=5<br/>(de-prioritized)"]
+    end
+
+    Admission["AdmissionPolicy<br/>(PriorityAdmissionPolicy)<br/>priority < threshold ?"]
+
+    subgraph Pool["Shared host memory pool (HMPM-owned)"]
+        direction TB
+        FastMed["FAST_CPU medium<br/>blocks for hi-priority work"]:::fast
+        SlowMed["SLOW_CPU medium<br/>blocks for lo-priority work"]:::slow
+    end
+
+    ReqHi --> Admission
+    ReqLo --> Admission
+    Admission -- "yes" --> FastMed
+    Admission -- "no" --> SlowMed
+
+    FastMed -. "no demote / no promote<br/>(separate populations)" .- SlowMed
+
+    classDef fast fill:#ffe6cc,stroke:#d79b00
+    classDef slow fill:#dae8fc,stroke:#6c8ebf

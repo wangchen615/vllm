@@ -1,0 +1,41 @@
+%% Emulator overview: one mmap-backed shared host pool, surfaced to vLLM as
+%% FAST_CPU and SLOW_CPU media; HMPM owns the pool; multiple vLLM instances attach.
+%% See docs/design/rfcs/secondary-memory-system-overview.md
+flowchart LR
+    subgraph HMPMService["HMPM (external service)"]
+        direction TB
+        HMPM["HostMemoryPoolManager<br/>service"]
+        SharedPool["mmap region<br/>/dev/shm/hillock_secondary_pool.mmap"]
+        AllocTable["allocation table<br/>(deployment_id, key) → (medium, block_id)"]
+        Heartbeat["heartbeat tracker<br/>(per-deployment liveness)"]
+        HMPM --- SharedPool
+        HMPM --- AllocTable
+        HMPM --- Heartbeat
+    end
+
+    subgraph VllmA["vLLM deployment A"]
+        SpecA["SecondaryMemoryOffloadingSpec"]
+        ClientA["HmpmClient"]
+        FastViewA["FAST_CPU view<br/>(slice of pool)"]
+        SlowViewA["SLOW_CPU view<br/>(slice of pool)"]
+        SpecA --> ClientA
+        ClientA --> FastViewA
+        ClientA --> SlowViewA
+    end
+
+    subgraph VllmB["vLLM deployment B"]
+        SpecB["SecondaryMemoryOffloadingSpec"]
+        ClientB["HmpmClient"]
+        FastViewB["FAST_CPU view"]
+        SlowViewB["SLOW_CPU view"]
+        SpecB --> ClientB
+        ClientB --> FastViewB
+        ClientB --> SlowViewB
+    end
+
+    ClientA <-.->|UDS attach/allocate/<br/>lookup_peer/claim_orphan| HMPM
+    ClientB <-.->|UDS attach/allocate/<br/>lookup_peer/claim_orphan| HMPM
+    FastViewA -. mmap slice .-> SharedPool
+    SlowViewA -. mmap slice .-> SharedPool
+    FastViewB -. mmap slice .-> SharedPool
+    SlowViewB -. mmap slice .-> SharedPool

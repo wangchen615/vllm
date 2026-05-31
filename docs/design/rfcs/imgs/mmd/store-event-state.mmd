@@ -1,0 +1,15 @@
+%% State machine: OffloadingEvent (medium-tagged) lifecycle.
+%% Green path is M1; Failed/Quarantined branch is the resiliency RFC.
+%% See docs/design/rfcs/exclusive-tiered-caching.md
+stateDiagram-v2
+    [*] --> Pending : prepare_store returns
+    Pending --> InFlight : worker.start_transfer
+    InFlight --> Completed : torch.Event ready
+    Completed --> Reported : take_events drained
+    Reported --> [*]
+
+    InFlight --> Failed : timeout / error<br/>(resiliency RFC only)
+    Failed --> Quarantined : N consecutive failures<br/>(resiliency RFC only)
+    Quarantined --> [*] : medium re-enabled
+
+    note right of Reported : OffloadingEvent.medium tags the<br/>destination (FAST_CPU or SLOW_CPU);<br/>per-medium counters fall out for free.

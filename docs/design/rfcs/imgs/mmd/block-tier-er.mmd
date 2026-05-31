@@ -1,0 +1,47 @@
+%% ER diagram: how an OffloadKey relates to physical blocks across media,
+%% deployments, and requests, mediated by the HMPM allocation table.
+%% Cardinality "OFFLOAD_KEY ||--o{ MEDIUM_RESIDENCE" means N=1 in partitioned (M1)
+%% per deployment; N>=1 across deployments and in inclusive/replicate modes.
+%% See docs/design/rfcs/exclusive-tiered-caching.md
+erDiagram
+    REQUEST ||--o{ OFFLOAD_KEY : "produces / consumes"
+    OFFLOAD_KEY ||--o{ MEDIUM_RESIDENCE : "lives in N media"
+    DEPLOYMENT ||--o{ MEDIUM_RESIDENCE : "owns"
+    MEDIUM ||--o{ MEDIUM_RESIDENCE : "categorizes"
+    MEDIUM_RESIDENCE ||--|| PHYSICAL_BLOCK : "occupies"
+    HMPM_POOL ||--o{ PHYSICAL_BLOCK : "contains"
+    HMPM_POOL ||--o{ MEDIUM : "surfaces"
+
+    REQUEST {
+        string request_id
+        int priority
+    }
+    OFFLOAD_KEY {
+        bytes block_hash
+        int group_idx
+    }
+    DEPLOYMENT {
+        string deployment_id
+        timestamp last_heartbeat
+        string status
+    }
+    MEDIUM_RESIDENCE {
+        bytes offload_key_FK
+        string deployment_id_FK
+        string medium
+        int physical_block_id
+    }
+    MEDIUM {
+        string medium_name
+        int num_blocks
+        bool writable
+        bool externally_managed
+    }
+    PHYSICAL_BLOCK {
+        int block_id
+        int byte_offset
+    }
+    HMPM_POOL {
+        string mmap_path
+        int total_bytes
+    }
