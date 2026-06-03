@@ -20,6 +20,10 @@ name: codex-review
 on:
   pull_request:
     types: [opened, reopened, ready_for_review, synchronize]
+    # Only review PRs targeting dev. All active development on this fork
+    # merges into dev, not main; main is kept synced with upstream.
+    branches:
+      - dev
 
 # One in-flight retrigger per PR. If you push three commits in a burst,
 # only the last one posts the @codex review comment. Cancels stale runs.
